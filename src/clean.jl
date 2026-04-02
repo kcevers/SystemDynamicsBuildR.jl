@@ -57,7 +57,8 @@ julia> saveat_func(t, y, new_t)
 - Automatically handles sorting of time points
 """
 function saveat_func(t, y, new_times)
-    return itp(t, y, method="linear", extrapolation="nearest")(new_times)
+    f = itp(t, y, method="linear", extrapolation="nearest")
+    return f.(new_times)
 end
 
 # ============================================================================
@@ -154,10 +155,11 @@ function clean_df(prob, solve_out, init_names,
     init_values = Float64[]
     init_vals = prob.u0
     init_val_names = [string(name) for name in init_names]
+    init_val_symbols = Symbol.(init_val_names)
 
     if isa(init_vals, NamedTuple)
-        for init_name in init_val_names
-            init_val = getproperty(init_vals, Symbol(init_name))
+        for init_sym in init_val_symbols
+            init_val = getproperty(init_vals, init_sym)
             init_val_stripped = isa(init_val, Quantity) ? 
                 ustrip(init_val) : Float64(init_val)
             push!(init_values, init_val_stripped)
@@ -185,14 +187,13 @@ function clean_df(prob, solve_out, init_names,
         timeseries_df = DataFrame(
             time = time_vec,
             variable = variable_vec,
-            value = value_vec
+            value = value_vec;
+            copycols = false
         )
         return timeseries_df, param_values, param_names, init_values, init_val_names
     end
 
-    # Get time values
-    t_vals = isa(solve_out.t[1], Quantity) ? 
-        ustrip.(solve_out.t) : solve_out.t
+    has_time_units = isa(solve_out.t[1], Quantity)
 
     # Determine number of variables and their names
     if isa(solve_out.u[1], AbstractVector)
@@ -202,15 +203,30 @@ function clean_df(prob, solve_out, init_names,
         n_vars = 1
         var_names = [string(init_names[1])]
     end
+    var_name_symbols = Symbol.(var_names)
+
+    # Provide capacity hints to reduce push! reallocations.
+    n_t = length(solve_out.t)
+    base_rows = n_t * n_vars
+    int_rows = if !isnothing(intermediaries) && !isnothing(intermediary_names) && !isempty(intermediaries.t)
+        n_int_vars = isa(intermediaries.saveval[1], Union{AbstractVector, Tuple}) ? length(intermediaries.saveval[1]) : 1
+        length(intermediaries.t) * n_int_vars
+    else
+        0
+    end
+    sizehint!(time_vec, base_rows + int_rows)
+    sizehint!(variable_vec, base_rows + int_rows)
+    sizehint!(value_vec, base_rows + int_rows)
 
     # Process main solution
-    for (t_idx, t_val) in enumerate(t_vals)
+    for (t_idx, t_raw) in enumerate(solve_out.t)
+        t_val = has_time_units ? ustrip(t_raw) : Float64(t_raw)
         u_val = solve_out.u[t_idx]
 
         if isa(u_val, NamedTuple)
             # Handle NamedTuple format (e.g., (S=990.0, I=10.0, R=0.0))
-            for var_name in var_names
-                var_val = getproperty(u_val, Symbol(var_name))
+            for (var_name, var_sym) in zip(var_names, var_name_symbols)
+                var_val = getproperty(u_val, var_sym)
                 if !isa(var_val, Function)
                     val_stripped = isa(var_val, Quantity) ? 
                         ustrip(var_val) : Float64(var_val)
@@ -251,11 +267,11 @@ function clean_df(prob, solve_out, init_names,
     if !isnothing(intermediaries) && !isnothing(intermediary_names) && 
        !isempty(intermediaries.t)
         
-        int_t_vals = isa(intermediaries.t[1], Quantity) ? 
-            ustrip.(intermediaries.t) : intermediaries.t
+        int_has_time_units = isa(intermediaries.t[1], Quantity)
         int_var_names = [string(name) for name in intermediary_names]
 
-        for (t_idx, t_val) in enumerate(int_t_vals)
+        for (t_idx, t_raw) in enumerate(intermediaries.t)
+            t_val = int_has_time_units ? ustrip(t_raw) : Float64(t_raw)
             saved_val = intermediaries.saveval[t_idx]
 
             if isa(saved_val, Union{AbstractVector, Tuple})
@@ -290,7 +306,8 @@ function clean_df(prob, solve_out, init_names,
     timeseries_df = DataFrame(
         time = time_vec,
         variable = variable_vec,
-        value = value_vec
+        value = value_vec;
+        copycols = false
     )
 
     return timeseries_df, param_values, param_names, init_values, init_val_names

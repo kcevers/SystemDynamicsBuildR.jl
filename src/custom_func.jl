@@ -13,7 +13,6 @@ This module is designed to work seamlessly with Unitful quantities.
 module custom_func
 
 using Unitful
-using DataInterpolations
 using Distributions
 using ..unit_func: convert_u
 
@@ -44,14 +43,14 @@ julia> is_function_or_interp(5)
 false
 ```
 """
-is_function_or_interp(x) = isa(x, Function) || isa(x, DataInterpolations.AbstractInterpolation)
+is_function_or_interp(x) = isa(x, Function) || isa(x, Interpolator)
 
 # ============================================================================
 # Interpolation Functions
 # ============================================================================
 
 """
-    itp(x, y; method="linear", extrapolation="nearest")
+    itp(x, y; method="linear", extrapolation="constant")
 
 Create an interpolation function from vectors `x` and `y`.
 
@@ -59,10 +58,10 @@ Create an interpolation function from vectors `x` and `y`.
 - `x::AbstractVector`: Independent variable values (will be sorted)
 - `y::AbstractVector`: Dependent variable values
 - `method::String="linear"`: Interpolation method ("linear" or "constant")
-- `extrapolation::String="nearest"`: Extrapolation behavior ("nearest" or "NA")
+- `extrapolation::String="constant"`: Extrapolation behavior ("constant", "linear", "missing", or "error")
 
 # Returns
-- `AbstractInterpolation`: Interpolation object that can be called as a function
+- `Interpolator`: Interpolation object that can be called as a function
 
 # Examples
 ```julia
@@ -73,38 +72,153 @@ julia> f(1.5)
 julia> f = itp([1, 3, 2], [10, 30, 20])  # Automatically sorted
 julia> f(2.5)
 25.0
+
+julia> f = itp([1, 2, 3], [10, 20, 30], extrapolation="missing")
+julia> f(5.0)  # Outside range
+missing
 ```
 """
-function itp(x, y; method="linear", extrapolation="nearest")
+function itp(x, y; method="linear", extrapolation="constant")
     # Ensure y is sorted along x
     idx = sortperm(x)
-    x = x[idx]
-    y = y[idx]
+    x_sorted = x[idx]
+    y_sorted = y[idx]
 
-    # Extrapolation rule: What happens outside of defined values?
-    # Rule "NA": return NaN; Rule "nearest": return closest value
-    rule_method = if extrapolation == "NA"
-        DataInterpolations.ExtrapolationType.None
-    elseif extrapolation == "nearest"
-        DataInterpolations.ExtrapolationType.Constant
-    else
-        extrapolation
+    # Convert string arguments to symbols
+    method_sym = Symbol(method)
+    extrap_sym = Symbol(extrapolation)
+    
+    # Validate method
+    if !(method_sym in (:linear, :constant))
+        throw(ArgumentError("Method must be 'linear' or 'constant', got: $method"))
+    end
+    
+    # Validate and handle extrapolation aliases for backwards compatibility
+    if extrapolation == "nearest"
+        # Map old "nearest" to "constant" for backwards compatibility
+        extrap_sym = :constant
+    elseif extrapolation == "NA"
+        # Map old "NA" to "missing" for backwards compatibility
+        extrap_sym = :missing
+    elseif !(extrap_sym in (:constant, :linear, :missing, :error))
+        throw(ArgumentError("Extrapolation must be 'constant', 'linear', 'missing', or 'error', got: $extrapolation"))
     end
 
-    if method == "constant"
-        func = DataInterpolations.ConstantInterpolation(y, x; extrapolation=rule_method)
-    elseif method == "linear"
-        func = DataInterpolations.LinearInterpolation(y, x; extrapolation=rule_method)
-    else
-        throw(ArgumentError("Method must be 'constant' or 'linear', got: $method"))
-    end
+    return Interpolator(x_sorted, y_sorted, method=method_sym, extrap=extrap_sym)
+end
 
-    return func
+
+"""
+Unified interpolator with configurable interpolation and extrapolation methods
+"""
+struct Interpolator{TX,TY}
+    x::TX
+    y::TY
+    method::Symbol
+    extrap::Symbol
+    
+    function Interpolator(x, y; method=:linear, extrap=:constant)
+        @assert length(x) == length(y) "x and y must have same length"
+        @assert issorted(x) "x must be sorted"
+        @assert method in (:linear, :constant) "method must be :linear or :constant"
+        @assert extrap in (:constant, :linear, :missing, :error) "extrap must be :constant, :linear, :missing, or :error"
+        
+        # Validate extrap is compatible with method
+        if method == :constant && extrap == :linear
+            error("Linear extrapolation is not supported for constant interpolation")
+        end
+        
+        new{typeof(x), typeof(y)}(x, y, method, extrap)
+    end
+end
+
+# Make it callable for scalar inputs
+function (interp::Interpolator)(x::Number)
+    if interp.method == :linear
+        return _linear_interp(interp, x)
+    elseif interp.method == :constant
+        return _constant_interp(interp, x)
+    end
+end
+
+# Evaluate interpolation element-wise for vector/matrix inputs.
+function (interp::Interpolator)(x::AbstractArray)
+    return interp.(x)
+end
+
+# Internal linear interpolation
+function _linear_interp(interp::Interpolator, x)
+    idx = searchsortedlast(interp.x, x)
+    
+    # Handle extrapolation
+    if idx == 0
+        if interp.extrap == :constant
+            return first(interp.y)
+        elseif interp.extrap == :linear
+            x1, x2 = interp.x[1], interp.x[2]
+            y1, y2 = interp.y[1], interp.y[2]
+            slope = (y2 - y1) / (x2 - x1)
+            return y1 + slope * (x - x1)
+        elseif interp.extrap == :missing
+            return missing
+        elseif interp.extrap == :error
+            error("x=$x is below range [$(first(interp.x)), $(last(interp.x))]")
+        end
+    elseif idx >= length(interp.x)
+        if interp.extrap == :constant
+            return last(interp.y)
+        elseif interp.extrap == :linear
+            x1, x2 = interp.x[end-1], interp.x[end]
+            y1, y2 = interp.y[end-1], interp.y[end]
+            slope = (y2 - y1) / (x2 - x1)
+            return y2 + slope * (x - x2)
+        elseif interp.extrap == :missing
+            return missing
+        elseif interp.extrap == :error
+            error("x=$x is above range [$(first(interp.x)), $(last(interp.x))]")
+        end
+    end
+    
+    # Interpolate
+    x1, x2 = interp.x[idx], interp.x[idx+1]
+    y1, y2 = interp.y[idx], interp.y[idx+1]
+    t = (x - x1) / (x2 - x1)
+    return y1 + t * (y2 - y1)
+end
+
+# Internal constant interpolation
+function _constant_interp(interp::Interpolator, x)
+    idx = searchsortedlast(interp.x, x)
+    
+    # Handle extrapolation
+    if idx == 0
+        if interp.extrap == :constant
+            return first(interp.y)
+        elseif interp.extrap == :missing
+            return missing
+        elseif interp.extrap == :error
+            error("x=$x is below range [$(first(interp.x)), $(last(interp.x))]")
+        end
+    end
+    
+    idx = clamp(idx, 1, length(interp.y))
+    return interp.y[idx]
 end
 
 # ============================================================================
 # Signal Generation Functions
 # ============================================================================
+
+_zero_with_unit(x) = isa(x, Unitful.Quantity) ? zero(x) : 0.0
+
+_normalize_time_arg(times, time_units, value) = begin
+    normalized = convert_u(value, time_units)
+    if eltype(times) <: Unitful.Quantity
+        return normalized
+    end
+
+    return Unitful.ustrip(normalized)
+end
 
 """
     make_ramp(time_units, times, start, finish, height=1.0)
@@ -137,18 +251,9 @@ function make_ramp(time_units, times, start, finish, height=1.0)
     # Normalize units between times and ramp parameters
     start, finish = _normalize_time_units(times, time_units, start, finish)
     
-    # Initialize ramp height
-    start_h_ramp = 0.0
-    add_y = 0.0
-    
-    # Match height units
-    if eltype(height) <: Unitful.Quantity
-        start_h_ramp = convert_u(start_h_ramp, Unitful.unit(height))
-        add_y = convert_u(0.0, Unitful.unit(height))
-    elseif !(eltype(height) <: Unitful.Quantity)
-        height = convert_u(height, Unitful.unit(start_h_ramp))
-        add_y = convert_u(0.0, Unitful.unit(start_h_ramp))
-    end
+    # Initialize with the same unit type as height when applicable
+    start_h_ramp = _zero_with_unit(height)
+    add_y = _zero_with_unit(height)
 
     if start > last(times)
         # If the pulse starts after the end of the time range, return a zero function    
@@ -201,7 +306,7 @@ function make_step(time_units, times, start, height=1.0)
     # Normalize units
     start = _normalize_single_time(times, time_units, start)
     
-    add_y = eltype(height) <: Unitful.Quantity ? convert_u(0.0, Unitful.unit(height)) : 0.0
+    add_y = _zero_with_unit(height)
 
     # If the step starts after the end of the time range, return a zero function    
     if start > last(times)
@@ -249,7 +354,7 @@ julia> p(8.0)  # Between pulses
 """
 function make_pulse(time_units, times, start, height=1.0, width=1.0 * time_units, repeat_interval=nothing)
     # Validate width
-    width_value = eltype(width) <: Unitful.Quantity ? Unitful.ustrip(convert_u(width, time_units)) : width
+    width_value = Unitful.ustrip(convert_u(width, time_units))
     if width_value <= 0.0
         throw(ArgumentError("The width of the pulse cannot be equal to or less than 0; to indicate an 'instantaneous' pulse, specify the simulation step size (dt)."))
     end
@@ -257,7 +362,7 @@ function make_pulse(time_units, times, start, height=1.0, width=1.0 * time_units
     # Normalize units
     start, width, repeat_interval = _normalize_pulse_units(times, time_units, start, width, repeat_interval)
 
-    add_y = eltype(height) <: Unitful.Quantity ? convert_u(0.0, Unitful.unit(height)) : 0.0
+    add_y = _zero_with_unit(height)
 
     if start > last(times)
         # If the pulse starts after the end of the time range, return a zero function    
@@ -284,7 +389,7 @@ function make_pulse(time_units, times, start, height=1.0, width=1.0 * time_units
             # Build signal as vectors of times and y-values
             end_ts = start_ts .+ width
             signal_times = [start_ts; end_ts]
-            signal_y = [fill(height, length(start_ts)); fill(0, length(end_ts))]
+            signal_y = [fill(height, length(start_ts)); fill(add_y, length(end_ts))]
         end
     end
 
@@ -337,7 +442,14 @@ function make_seasonal(dt, times, period=u"1yr", shift=u"0yr")
     @assert Unitful.ustrip(period) > 0 "The period of the seasonal wave must be greater than 0."
 
     time_vec = times[1]:dt:times[2]
-    phase = 2 * pi .* (time_vec .- shift) ./ period
+    if isa(first(time_vec), Unitful.Quantity) || isa(period, Unitful.Quantity) || isa(shift, Unitful.Quantity)
+        time_num = Unitful.ustrip.(time_vec)
+        shift_num = isa(shift, Unitful.Quantity) ? Unitful.ustrip(shift) : shift
+        period_num = isa(period, Unitful.Quantity) ? Unitful.ustrip(period) : period
+        phase = 2 * pi .* (time_num .- shift_num) ./ period_num
+    else
+        phase = 2 * pi .* (time_vec .- shift) ./ period
+    end
     y = cos.(phase)
     func = itp(time_vec, y, method="linear", extrapolation="nearest")
 
@@ -356,20 +468,12 @@ Internal helper to normalize time units between simulation times and signal para
 function _normalize_time_units(times, time_units, start, finish)
     if eltype(times) <: Unitful.Quantity
         # Times have units, ensure start/finish match
-        if !(eltype(start) <: Unitful.Quantity)
-            start = convert_u(start, time_units)
-        end
-        if !(eltype(finish) <: Unitful.Quantity)
-            finish = convert_u(finish, time_units)
-        end
+        start = convert_u(start, time_units)
+        finish = convert_u(finish, time_units)
     else
-        # Times are unitless, convert start/finish if they have units
-        if eltype(start) <: Unitful.Quantity
-            start = Unitful.ustrip(convert_u(start, time_units))
-        end
-        if eltype(finish) <: Unitful.Quantity
-            finish = Unitful.ustrip(convert_u(finish, time_units))
-        end
+        # Times are unitless, coerce through time_units and strip to numeric values
+        start = _normalize_time_arg(times, time_units, start)
+        finish = _normalize_time_arg(times, time_units, finish)
     end
     return start, finish
 end
@@ -381,13 +485,9 @@ Internal helper to normalize a single time value.
 """
 function _normalize_single_time(times, time_units, start)
     if eltype(times) <: Unitful.Quantity
-        if !(eltype(start) <: Unitful.Quantity)
-            start = convert_u(start, time_units)
-        end
+        start = convert_u(start, time_units)
     else
-        if eltype(start) <: Unitful.Quantity
-            start = Unitful.ustrip(convert_u(start, time_units))
-        end
+        start = _normalize_time_arg(times, time_units, start)
     end
     return start
 end
@@ -399,24 +499,16 @@ Internal helper to normalize time units for pulse signals.
 """
 function _normalize_pulse_units(times, time_units, start, width, repeat_interval)
     if eltype(times) <: Unitful.Quantity
-        if !(eltype(start) <: Unitful.Quantity)
-            start = convert_u(start, time_units)
-        end
-        if !(eltype(width) <: Unitful.Quantity)
-            width = convert_u(width, time_units)
-        end
-        if !isnothing(repeat_interval) && !(eltype(repeat_interval) <: Unitful.Quantity)
+        start = convert_u(start, time_units)
+        width = convert_u(width, time_units)
+        if !isnothing(repeat_interval)
             repeat_interval = convert_u(repeat_interval, time_units)
         end
     else
-        if eltype(start) <: Unitful.Quantity
-            start = Unitful.ustrip(convert_u(start, time_units))
-        end
-        if eltype(width) <: Unitful.Quantity
-            width = Unitful.ustrip(convert_u(width, time_units))
-        end
-        if !isnothing(repeat_interval) && eltype(repeat_interval) <: Unitful.Quantity
-            repeat_interval = Unitful.ustrip(convert_u(repeat_interval, time_units))
+        start = _normalize_time_arg(times, time_units, start)
+        width = _normalize_time_arg(times, time_units, width)
+        if !isnothing(repeat_interval)
+            repeat_interval = _normalize_time_arg(times, time_units, repeat_interval)
         end
     end
     return start, width, repeat_interval

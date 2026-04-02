@@ -182,13 +182,9 @@ julia> convert_u([1000.0u"g", 2000.0u"g"], 1.0u"kg")
 """
 function convert_u(x::AbstractArray{<:Unitful.Quantity}, unit_def::Union{Unitful.Quantity, Unitful.Units})
     target_unit = unit_def isa Unitful.Quantity ? Unitful.unit(unit_def) : unit_def
-    
-    # Check if all elements already have the target unit
-    if all(Unitful.unit(xi) == target_unit for xi in x)
-        return x  # No conversion needed
-    else
-        return Unitful.uconvert.(target_unit, x)
-    end
+
+    # Single pass conversion is faster than pre-checking all elements first.
+    return Unitful.uconvert.(target_unit, x)
 end
 
 """

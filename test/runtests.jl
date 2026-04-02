@@ -8,4 +8,4 @@ using SystemDynamicsBuildR
     include("test_clean.jl")
     include("test_ensemble.jl")
     include("test_unit_func.jl")
-end
+end;

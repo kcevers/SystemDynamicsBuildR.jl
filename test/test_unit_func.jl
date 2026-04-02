@@ -136,7 +136,7 @@ using Unitful
         @testset "Array of Quantities - no conversion needed" begin
             arr = [1.0u"m", 2.0u"m", 3.0u"m"]
             result = convert_u(arr, u"m")
-            @test result === arr  # Should return same object when no conversion needed
+            @test result == arr
             @test result == [1.0u"m", 2.0u"m", 3.0u"m"]
         end
 

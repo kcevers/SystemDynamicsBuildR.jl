@@ -105,8 +105,8 @@ module sdbuildR_units
     @unit deg_ "deg_" Degree_ π/180 false
     @unit ohm_ "ohm_" Ohm_ 1u"V"/u"A" false
     @unit superconducting_magnetic_flux_quantum "superconducting_magnetic_flux_quantum" MagneticFluxQuantum u"h"/(2u"q") false
-    @unit degF "degF" DegreeFahrenheit 45967//100*u"Ra" false
-    @unit degC "degC" DegreeCelsius 27315//100*u"K" false
+    # @unit degF "degF" DegreeFahrenheit 45967//100*u"Ra" false # Added in Unitful v1.26.0
+    # @unit degC "degC" DegreeCelsius 27315//100*u"K" false # Added in Unitful v1.26.0
     @unit anghertz "anghertz" AngularHertz 2π/u"s" false
     @unit Rydberg_constant "Rydberg_constant" RydbergConstant 10_973_731.568_160/u"m" false
     

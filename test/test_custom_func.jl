@@ -171,6 +171,54 @@ using DataInterpolations
             @test_throws ArgumentError make_pulse(u"s", times, 5.0, 1.0, -1.0)
         end
 
+        @testset "signal normalization with unitless timeline" begin
+            times = [0.0, 10.0]
+
+            ramp = make_ramp(u"s", times, 2.0u"s", 6.0u"s", 10.0)
+            @test !(ramp(4.0) isa Unitful.Quantity)
+            @test ramp(0.0) ≈ 0.0
+            @test ramp(2.0) ≈ 0.0
+            @test ramp(4.0) ≈ 5.0
+            @test ramp(6.0) ≈ 10.0
+            @test ramp(8.0) ≈ 10.0
+
+            step = make_step(u"s", times, 5000.0u"ms", 2.0)
+            @test !(step(4.0) isa Unitful.Quantity)
+            @test step(4.9) ≈ 0.0
+            @test step(5.0) ≈ 2.0
+            @test step(9.0) ≈ 2.0
+
+            pulse = make_pulse(u"s", [0.0, 20.0], 5.0u"s", 1.0, 2.0u"s", 10.0u"s")
+            @test !(pulse(5.5) isa Unitful.Quantity)
+            @test pulse(4.0) ≈ 0.0
+            @test pulse(5.5) ≈ 1.0
+            @test pulse(7.1) ≈ 0.0
+            @test pulse(15.5) ≈ 1.0
+        end
+
+        @testset "signal normalization helpers" begin
+            times = [0.0, 10.0]
+
+            start_unitless, finish_unitless = SystemDynamicsBuildR.custom_func._normalize_time_units(
+                times, u"s", 2.0, 6.0
+            )
+            @test start_unitless == 2.0
+            @test finish_unitless == 6.0
+
+            start_unitful, finish_unitful = SystemDynamicsBuildR.custom_func._normalize_time_units(
+                times, u"s", 2.0u"hr", 6000.0u"ms"
+            )
+            @test start_unitful == 7200.0
+            @test finish_unitful == 6.0
+
+            pulse_start, pulse_width, pulse_repeat = SystemDynamicsBuildR.custom_func._normalize_pulse_units(
+                times, u"s", 1.5u"hr", 500.0u"ms", 2.0u"hr"
+            )
+            @test pulse_start == 5400.0
+            @test pulse_width == 0.5
+            @test pulse_repeat == 7200.0
+        end
+
         @testset "seasonal - basic wave" begin
             times = [0.0u"yr", 2.0u"yr"]
             wave = make_seasonal(0.1u"yr", times, 1.0u"yr", 0.0u"yr")
