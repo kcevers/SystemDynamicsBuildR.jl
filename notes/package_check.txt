@@ -1,0 +1,60 @@
+# Full Package Health Check
+
+## 1. Update Julia itself
+
+# Terminal command line:
+juliaup status         # check what versions you have
+juliaup update          # update juliaup itself + all installed Julia channels
+juliaup add release     # ensure latest stable is installed
+#juliaup add lts         # ensure latest LTS (1.10.x) is installed
+juliaup status          # confirm what versions you have
+
+## 2. Ensure you are in dev/ branch (not main/ branch) and have pulled latest changes
+git checkout dev
+git pull origin dev
+
+## 3. Update All Dependencies
+# In Julia REPL:
+using Pkg
+Pkg.activate(".")
+Pkg.update()          # update all packages to latest compatible versions
+Pkg.status()          # check status of all packages
+
+## 4. Check for Package Issues
+Pkg.resolve()         # resolve any dependency issues
+Pkg.precompile()      # precompile all packages
+
+## 5. Run Tests
+Pkg.test()            # run all tests defined in the package
+
+## 6. Manually increment version number in Project.toml
+
+## 7. Manually increment required Julia version in sdbuildR package
+
+## 8. Stage changes, commit, push
+
+## 9. Create Pull Request on GitHub from dev to main and merge to main branch
+
+## 10. Tag new release on GitHub with version number (e.g., version "1.0.0" -> "v1.0.0")
+
+
+
+## Extra: Check package load time
+# per-package import breakdown
+using InteractiveUtils; @time_imports using SystemDynamicsBuildR
+@time_imports using OrdinaryDiffEq
+@time_imports using CSV
+@time_imports using DataFrames
+@time_imports using DiffEqCallbacks
+@time_imports using Distributions
+@time_imports using OrdinaryDiffEq
+@time_imports using OrdinaryDiffEqLowOrderRK
+@time_imports using Random
+@time_imports using SciMLBase
+@time_imports using Statistics
+@time_imports using StatsBase
+
+# plain load time (fresh process, after precompiling once)
+@time (using SystemDynamicsBuildR)
+# time-to-first-call of the new custom funcs
+using SystemDynamicsBuildR; @time r_grep("a", ["apple","b"]); @time r_sort([3,1,2], true); @time r_rbind([1,2],[3,4]); @time r_match(["a"],["a","b"]); @time r_as_logical.([0,1,2])

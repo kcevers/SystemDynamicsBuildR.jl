@@ -1,8 +1,9 @@
 using SystemDynamicsBuildR.ensemble
 using DataFrames
-using Unitful
 using Statistics
 using OrdinaryDiffEq
+using SciMLBase
+using DiffEqCallbacks
 using Random
 
 @testset "ensemble tests" begin
@@ -177,8 +178,8 @@ using Random
             
             # Check time series
             @test nrow(ts_df) == length(sol.t)
-            @test all(ts_df.j .== 1)
-            @test all(ts_df.i .== 1)
+            @test all(ts_df.condition .== 1)
+            @test all(ts_df.sim .== 1)
             @test ts_df.time == sol.t
             @test all(ts_df.variable .== "stock")
             
@@ -266,49 +267,20 @@ using Random
                 solve_out, [:stock], nothing, nothing, 2  # 2 replicates per condition
             )
             
-            # Check j indices (parameter combination)
-            @test 1 in ts_df.j
-            @test 2 in ts_df.j
-            
-            # Check i indices (replicate)
-            @test all(i -> i in [1, 2], ts_df.i)
-            
+            # Check condition indices (parameter combination)
+            @test 1 in ts_df.condition
+            @test 2 in ts_df.condition
+
+            # Check sim indices (replicate)
+            @test all(s -> s in [1, 2], ts_df.sim)
+
             # Verify structure matches 2x2 ensemble
             for combo_j in [1, 2]
                 for replicate_i in [1, 2]
-                    subset_data = subset(ts_df, [:j, :i] => ByRow((j, i) -> j == combo_j && i == replicate_i))
+                    subset_data = subset(ts_df, [:condition, :sim] => ByRow((condition, sim) -> condition == combo_j && sim == replicate_i))
                     @test nrow(subset_data) > 0
                 end
             end
-        end
-
-        @testset "With Unitful quantities in ODE output" begin
-            # Define model with units
-            function decay_units!(du, u, p, t)
-                du[1] = -p.rate * u[1]
-            end
-            
-            u0 = 10.0u"mol"
-            prob = ODEProblem(decay_units!, [u0], (0.0u"hr", 2.0u"hr"), (rate = 0.5u"hr^-1",))
-            sol = solve(prob, Tsit5(), saveat = 1.0u"hr")
-            
-            solve_out = [
-                (
-                    t = sol.t,
-                    u = vec(sol.u),
-                    u0 = u0,
-                    p = (rate = 0.5u"hr^-1",)
-                )
-            ]
-            
-            ts_df, param_df, init_df = ensemble_to_df(
-                solve_out, [:concentration], nothing, nothing, 1
-            )
-            
-            # Units should be stripped
-            @test all(typeof.(ts_df.time) .== Float64)
-            @test all(typeof.(ts_df.value) .== Float64)
-            @test all(typeof.(param_df.value) .== Float64)
         end
 
         @testset "With intermediaries from S-I-R model" begin
@@ -358,24 +330,212 @@ using Random
             function model!(du, u, p, t)
                 du[1] = -p[1] * u[1] + p[2]
             end
-            
+
             Random.seed!(111)
             u0 = [5.0]
             prob = ODEProblem(model!, u0, (0.0, 1.0), [0.5, 2.0, 3.0])
             sol = solve(prob, Tsit5(), saveat = 0.5)
-            
+
             solve_out = [
                 (t = sol.t, u = vec(sol.u), u0 = u0[1], p = [0.5, 2.0, 3.0])
             ]
-            
+
             _, param_df, _ = ensemble_to_df(
                 solve_out, [:u], nothing, nothing, 1
             )
-            
+
             @test nrow(param_df) == 3
             @test "p1" in param_df.variable
             @test "p2" in param_df.variable
             @test "p3" in param_df.variable
+        end
+
+        @testset "Scalar state variable from out-of-place ODE" begin
+            # Out-of-place scalar ODE: sol.u is Vector{Float64}, not Vector{Vector{Float64}}
+            # This exercises the else branch at ensemble.jl:155-157 and the scalar u_val
+            # path inside process_solution_like.
+            decay_scalar(u, p, t) = -p.rate * u
+
+            Random.seed!(222)
+            solve_out = []
+            for _ in 1:3
+                u0 = 10.0 + randn() * 0.2
+                prob = ODEProblem(decay_scalar, u0, (0.0, 2.0), (rate = 0.5,))
+                sol = solve(prob, Tsit5(), saveat = 1.0)
+                push!(solve_out, (t = sol.t, u = sol.u, u0 = u0, p = (rate = 0.5,)))
+            end
+
+            # sol.u[1] is a plain Float64 → hits the scalar branch
+            @test !isa(solve_out[1].u[1], AbstractVector)
+
+            ts_df, param_df, init_df = ensemble_to_df(
+                solve_out, [:stock], nothing, nothing, 1
+            )
+
+            n_times = length(solve_out[1].t)
+            @test nrow(ts_df) == 3 * n_times
+            @test all(ts_df.variable .== "stock")
+            @test all(ts_df.value .> 0)  # exponential decay stays positive
+
+            @test nrow(param_df) == 3   # 3 trajectories × 1 param
+            @test "rate" in param_df.variable
+
+            @test nrow(init_df) == 3
+            @test all(init_df.variable .== "stock")
+        end
+
+        @testset "EnsembleSolution passed directly (with output_func)" begin
+            # Mirrors the real usage pattern: solve(EnsembleProblem) returns an
+            # EnsembleSolution; ensemble_to_df must unwrap it before indexing.
+            function decay!(du, u, p, t)
+                du[1] = -p.rate * u[1]
+            end
+
+            Random.seed!(444)
+            base_prob = ODEProblem(decay!, [10.0], (0.0, 2.0), (rate = 0.5,))
+
+            function prob_func_decay(prob, ctx)
+                u0_new = 10.0 + randn(ctx.rng) * 0.2
+                remake(prob, u0 = [u0_new])
+            end
+
+            function output_func_decay(sol, ctx)
+                return (t = sol.t, u = sol.u, p = sol.prob.p, u0 = sol.prob.u0), false
+            end
+
+            ensemble_prob = EnsembleProblem(base_prob,
+                prob_func = prob_func_decay,
+                output_func = output_func_decay)
+            solve_out = solve(ensemble_prob, Tsit5(), EnsembleSerial(),
+                              trajectories = 3, saveat = 1.0)
+
+            # solve_out is an EnsembleSolution, not a plain Vector
+            @test !isa(solve_out, Vector)
+
+            ts_df, param_df, init_df = ensemble_to_df(
+                solve_out, [:stock], nothing, nothing, 1
+            )
+
+            n_times = length(solve_out.u[1].t)
+            @test nrow(ts_df) == 3 * n_times
+            @test all(ts_df.variable .== "stock")
+            @test all(ts_df.value .> 0)
+            @test nrow(param_df) == 3
+            @test "rate" in param_df.variable
+            @test nrow(init_df) == 3
+            @test all(init_df.variable .== "stock")
+        end
+
+        @testset "EnsembleSolution with intermediaries via SavingCallback" begin
+            # Full integration test matching the user's R-script pattern:
+            # EnsembleProblem + output_func + SavingCallback intermediaries.
+            function decay_cb!(du, u, p, t)
+                du[1] = -p.rate * u[1]
+            end
+
+            function save_flow(current_state, t, integrator)
+                return integrator.p.rate * current_state[1]  # outflow = rate * stock
+            end
+
+            n_traj = 3
+            saveat_times = 0.0:1.0:2.0
+
+            intermediaries_cb = Vector{SavedValues{Float64, Any}}(undef, n_traj)
+            for k in eachindex(intermediaries_cb)
+                intermediaries_cb[k] = SavedValues(Float64, Any)
+            end
+
+            Random.seed!(555)
+            base_prob_cb = ODEProblem(decay_cb!, [10.0], (0.0, 2.0), (rate = 0.5,))
+
+            function prob_func_cb(prob, ctx)
+                k = ctx.sim_id
+                u0_new = 10.0 + randn(ctx.rng) * 0.2
+                cb = SavingCallback(save_flow, intermediaries_cb[k], saveat = saveat_times)
+                remake(prob, u0 = [u0_new], callback = cb)
+            end
+
+            function output_func_cb(sol, ctx)
+                return (t = sol.t, u = sol.u, p = sol.prob.p, u0 = sol.prob.u0), false
+            end
+
+            ensemble_prob_cb = EnsembleProblem(base_prob_cb,
+                prob_func = prob_func_cb,
+                output_func = output_func_cb)
+            solve_out_cb = solve(ensemble_prob_cb, Tsit5(), EnsembleSerial(),
+                                 trajectories = n_traj, saveat = saveat_times)
+
+            ts_df, param_df_cb, init_df_cb = ensemble_to_df(
+                solve_out_cb, [:stock],
+                intermediaries_cb, [:flow],
+                1
+            )
+
+            @test "stock" in ts_df.variable
+            @test "flow" in ts_df.variable
+
+            # Each variable should have n_traj × n_time_points rows
+            n_times = length(saveat_times)
+            stock_rows = subset(ts_df, :variable => ByRow(==("stock")))
+            flow_rows  = subset(ts_df, :variable => ByRow(==("flow")))
+            @test nrow(stock_rows) == n_traj * n_times
+            @test nrow(flow_rows)  == n_traj * n_times
+
+            # Flow values should be positive (rate × positive stock)
+            @test all(flow_rows.value .> 0)
+
+            # param_df: n_traj trajectories × 1 parameter (:rate)
+            @test nrow(param_df_cb) == n_traj
+            @test "rate" in param_df_cb.variable
+
+            # init_df: n_traj trajectories × 1 initial condition (:stock)
+            @test nrow(init_df_cb) == n_traj
+            @test all(init_df_cb.variable .== "stock")
+        end
+
+        @testset "No parameters (empty NamedTuple constants)" begin
+            # Models with no free parameters return param_df with zero rows.
+            # param_df must still have the correct columns so ensemble_summ works.
+            function grow!(du, u, p, t)
+                du[1] = u[1]
+            end
+
+            u0 = [1.0]
+            prob_np = ODEProblem(grow!, u0, (0.0, 2.0), ())  # empty params
+            solve_out = []
+            for i in 1:3
+                sol = solve(prob_np, Tsit5(), saveat = 1.0)
+                push!(solve_out, (t = sol.t, u = sol.u, u0 = u0[1], p = ()))
+            end
+
+            ts_df, param_df, init_df = ensemble_to_df(solve_out, [:S], nothing, nothing, 1)
+
+            # timeseries: 3 trajectories × n_times time points, all for variable "S"
+            n_times = length(solve_out[1].t)
+            @test nrow(ts_df) == 3 * n_times
+            @test all(ts_df.variable .== "S")
+            @test all(ts_df.value .> 0)  # exponential growth stays positive
+
+            # ensemble_summ on the timeseries must work and return one row per (condition, time) pair
+            summ = ensemble_summ(ts_df)
+            n_j = length(unique(ts_df.condition))
+            @test nrow(summ) == n_j * n_times
+
+            # param_df must have the correct column schema even with zero rows
+            @test nrow(param_df) == 0
+            @test hasproperty(param_df, :condition)
+            @test hasproperty(param_df, :sim)
+            @test hasproperty(param_df, :variable)
+            @test hasproperty(param_df, :value)
+
+            # ensemble_summ must not error on the empty param_df
+            param_df[!, :time] .= 0.0
+            summ_empty = ensemble_summ(param_df)
+            @test nrow(summ_empty) == 0
+
+            # init_df: 3 trajectories × 1 initial condition (:S), scalar u0
+            @test nrow(init_df) == 3
+            @test all(init_df.variable .== "S")
         end
     end
 
@@ -403,17 +563,17 @@ using Random
         total_trajectories = length(alphas) * ensemble_n
         
         # Function to generate different parameters and initial conditions for each trajectory
-        function prob_func(prob, i, repeat)
+        function prob_func(prob, ctx)
             # Map trajectory index to (combo_idx, replicate_idx)
+            i = ctx.sim_id
             combo_idx = div(i - 1, ensemble_n) + 1
-            replicate_idx = rem(i - 1, ensemble_n) + 1
-            
+
             # Get alpha value for this parameter combination
             alpha_val = alphas[combo_idx]
-            
+
             # Each trajectory gets a different initial condition
-            u0_new = 10.0 + randn() * 0.1
-            
+            u0_new = 10.0 + randn(ctx.rng) * 0.1
+
             # Update both u0 and parameter α
             remake(prob, u0 = [u0_new], p = (alpha = alpha_val,))
         end
@@ -430,7 +590,7 @@ using Random
             alpha_val = alphas[combo_idx]
             
             # Get solution for this trajectory
-            sol = ensemble_sol[i]
+            sol = ensemble_sol.u[i]
             
             # Get initial condition from this trajectory's actual u0
             u0_actual = sol.u[1][1]
@@ -464,9 +624,9 @@ using Random
         @test "stock" in ts_df.variable
         @test "flow" in ts_df.variable
         
-        # Test 2: Check that both j and i are present with correct ranges
-        @test all(j -> j in [1, 2], ts_df.j)
-        @test all(i -> i in [1, 2, 3], ts_df.i)
+        # Test 2: Check that both condition and sim are present with correct ranges
+        @test all(c -> c in [1, 2], ts_df.condition)
+        @test all(s -> s in [1, 2, 3], ts_df.sim)
         
         # Test 3: Non-stocks should have values for ALL replicas
         # If bug exists, only i=1 will have non-NA flow values
@@ -474,12 +634,12 @@ using Random
         stock_data = subset(ts_df, :variable => ByRow(==("stock")))
         
         # Stocks should work fine for all combos and replicates
-        stock_counts = combine(groupby(stock_data, [:j, :i]), nrow => :count)
+        stock_counts = combine(groupby(stock_data, [:condition, :sim]), nrow => :count)
         @test all(row -> row.count > 0, eachrow(stock_counts))
-        
+
         # Non-stocks must also work for all combos and replicates
-        # This will FAIL if the bug exists (only i=1 populated)
-        flow_counts = combine(groupby(flow_data, [:j, :i]), nrow => :count)
+        # This will FAIL if the bug exists (only sim=1 populated)
+        flow_counts = combine(groupby(flow_data, [:condition, :sim]), nrow => :count)
         @test all(row -> row.count > 0, eachrow(flow_counts))
         
         # Test 4: No missing or NaN values in flows
@@ -489,8 +649,8 @@ using Random
         # Test 5: Check that each (j, i) combination has expected coverage
         for combo_j in [1, 2]
             for replicate_i in [1, 2, 3]
-                flow_subset = subset(flow_data, 
-                    [:j, :i] => ByRow((j, i) -> j == combo_j && i == replicate_i))
+                flow_subset = subset(flow_data,
+                    [:condition, :sim] => ByRow((condition, sim) -> condition == combo_j && sim == replicate_i))
                 
                 # Should have flow data for this replicate
                 @test nrow(flow_subset) > 0
@@ -516,8 +676,8 @@ using Random
                 
                 for (t_idx, t_val) in enumerate(sol.t)
                     push!(timeseries_data, (
-                        j = 1,
-                        i = i,
+                        condition = 1,
+                        sim = i,
                         time = t_val,
                         variable = "stock",
                         value = sol.u[t_idx][1]
@@ -544,8 +704,8 @@ using Random
         @testset "Handling NaN and missing from actual simulations" begin
             # Simulate data where some replicates fail to compute (represented as NaN)
             timeseries_df = DataFrame(
-                j = [1, 1, 1, 1],
-                i = [1, 2, 3, 4],
+                condition = [1, 1, 1, 1],
+                sim = [1, 2, 3, 4],
                 time = [0.0, 0.0, 0.0, 0.0],
                 variable = ["x", "x", "x", "x"],
                 value = [10.0, NaN, 12.0, missing]
@@ -561,8 +721,8 @@ using Random
         @testset "All NaN values from failed ensemble" begin
             # All trajectories failed (represented as NaN)
             timeseries_df = DataFrame(
-                j = [1, 1],
-                i = [1, 2],
+                condition = [1, 1],
+                sim = [1, 2],
                 time = [0.0, 0.0],
                 variable = ["x", "x"],
                 value = [NaN, NaN]
@@ -593,18 +753,18 @@ using Random
                 sol = solve(prob, Tsit5(), saveat = [0.0])
                 
                 push!(timeseries_data, (
-                    j = 1, i = i, time = 0.0, variable = "S",
+                    condition = 1, sim = i, time = 0.0, variable = "S",
                     value = sol.u[1][1]
                 ))
                 push!(timeseries_data, (
-                    j = 1, i = i, time = 0.0, variable = "I",
+                    condition = 1, sim = i, time = 0.0, variable = "I",
                     value = sol.u[1][2]
                 ))
             end
-            
+
             timeseries_df = DataFrame(timeseries_data)
             stats = ensemble_summ(timeseries_df)
-            
+
             @test nrow(stats) >= 2  # At least S and I statistics
             
             s_stats = subset(stats, :variable => ByRow(==("S")))
@@ -621,8 +781,8 @@ using Random
             values = sort(randn(100) .* 2 .+ 50)  # Some realistic values
             
             timeseries_df = DataFrame(
-                j = [1 for _ in 1:100],
-                i = 1:100,
+                condition = [1 for _ in 1:100],
+                sim = 1:100,
                 time = [0.0 for _ in 1:100],
                 variable = ["x" for _ in 1:100],
                 value = values
@@ -657,8 +817,8 @@ using Random
                         t_idx = findfirst(x -> x ≈ t_val, sol.t)
                         
                         push!(timeseries_data, (
-                            j = alpha_idx,
-                            i = replicate,
+                            condition = alpha_idx,
+                            sim = replicate,
                             time = t_val,
                             variable = "stock",
                             value = sol.u[t_idx][1]
@@ -672,8 +832,8 @@ using Random
             
             @test nrow(stats) >= 2  # One row per j (at least)
             
-            j1_stats = subset(stats, :j => ByRow(==(1)))
-            j2_stats = subset(stats, :j => ByRow(==(2)))
+            j1_stats = subset(stats, :condition => ByRow(==(1)))
+            j2_stats = subset(stats, :condition => ByRow(==(2)))
             
             @test nrow(j1_stats) > 0
             @test nrow(j2_stats) > 0
@@ -708,12 +868,12 @@ using Random
             ts2, p2, i2 = ensemble_to_df_threaded(solve_out, [:S, :I], nothing, nothing, 1)
             
             # Results should be identical
-            @test ts1.j == ts2.j
-            @test ts1.i == ts2.i
+            @test ts1.condition == ts2.condition
+            @test ts1.sim == ts2.sim
             @test ts1.time == ts2.time
             @test ts1.variable == ts2.variable
             @test ts1.value == ts2.value
-            
+
             @test p1 == p2
             @test i1 == i2
         end
@@ -736,17 +896,17 @@ using Random
                 sol = solve(prob, Tsit5(), saveat = [0.0])
                 
                 push!(timeseries_data, (
-                    j = 1, i = i, time = 0.0, variable = "S",
+                    condition = 1, sim = i, time = 0.0, variable = "S",
                     value = sol.u[1][1]
                 ))
                 push!(timeseries_data, (
-                    j = 1, i = i, time = 0.0, variable = "I",
+                    condition = 1, sim = i, time = 0.0, variable = "I",
                     value = sol.u[1][2]
                 ))
             end
-            
+
             timeseries_df = DataFrame(timeseries_data)
-            
+
             stats1 = ensemble_summ(timeseries_df)
             stats2 = ensemble_summ_threaded(timeseries_df)
             
@@ -754,6 +914,32 @@ using Random
             @test isapprox(stats1.mean, stats2.mean, rtol=1e-10)
             @test isapprox(stats1.median, stats2.median, rtol=1e-10)
             @test isapprox(stats1.variance, stats2.variance, rtol=1e-10)
+        end
+
+        @testset "ensemble_to_df_threaded - scalar state variable" begin
+            # Same scalar ODE as the non-threaded test; verifies the threaded version
+            # also handles the scalar u path (ensemble.jl:408-410, 484-492).
+            decay_scalar_t(u, p, t) = -p.rate * u
+
+            Random.seed!(333)
+            solve_out = []
+            for _ in 1:3
+                u0 = 10.0 + randn() * 0.2
+                prob = ODEProblem(decay_scalar_t, u0, (0.0, 2.0), (rate = 0.5,))
+                sol = solve(prob, Tsit5(), saveat = 1.0)
+                push!(solve_out, (t = sol.t, u = sol.u, u0 = u0, p = (rate = 0.5,)))
+            end
+
+            ts1, p1, i1 = ensemble_to_df(solve_out, [:stock], nothing, nothing, 1)
+            ts2, p2, i2 = ensemble_to_df_threaded(solve_out, [:stock], nothing, nothing, 1)
+
+            @test ts1.condition == ts2.condition
+            @test ts1.sim == ts2.sim
+            @test ts1.time == ts2.time
+            @test ts1.variable == ts2.variable
+            @test ts1.value == ts2.value
+            @test p1 == p2
+            @test i1 == i2
         end
     end
 
@@ -805,8 +991,8 @@ using Random
             )
             
             @test nrow(ts_df) > 0
-            @test maximum(ts_df.j) == 4  # 4 parameter combinations
-            @test maximum(ts_df.i) == 2  # 2 replicates
+            @test maximum(ts_df.condition) == 4  # 4 parameter combinations
+            @test maximum(ts_df.sim) == 2  # 2 replicates
             
             # Compute summaries
             stats = ensemble_summ(ts_df)

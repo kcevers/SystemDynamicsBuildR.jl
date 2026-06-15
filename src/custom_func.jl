@@ -7,20 +7,20 @@ Custom utility functions for system dynamics modeling, including:
 - Mathematical utilities (logistic, logit, expit)
 - Random sampling functions
 - String/array utilities
-
-This module is designed to work seamlessly with Unitful quantities.
 """
 module custom_func
 
-using Unitful
 using Distributions
-using ..unit_func: convert_u
+using Random
 
 export itp, make_ramp, make_step, make_pulse, make_seasonal
-export round_IM, logit, expit, logistic
-export nonnegative, rbool, rdist
+export round_IM, logit, expit, logistic, hill, r_min, r_max, r_diff
+export r_as_logical, r_grep, r_rbind, r_upper_tri, r_lower_tri
+export r_na_omit, r_range, r_match, r_sort
+export r_rowsums, r_colsums, r_rowmeans, r_colmeans, r_cummax, r_cummin, r_rep
+export nonnegative, rbool, rdist, with_rng
 export indexof, contains_IM, round_
-export is_function_or_interp, ⊕
+export is_function_or_interp, ⊕, ⊘
 
 # ============================================================================
 # Type Checking Utilities
@@ -87,18 +87,16 @@ function itp(x, y; method="linear", extrapolation="constant")
     # Convert string arguments to symbols
     method_sym = Symbol(method)
     extrap_sym = Symbol(extrapolation)
-    
+
     # Validate method
     if !(method_sym in (:linear, :constant))
         throw(ArgumentError("Method must be 'linear' or 'constant', got: $method"))
     end
-    
+
     # Validate and handle extrapolation aliases for backwards compatibility
     if extrapolation == "nearest"
-        # Map old "nearest" to "constant" for backwards compatibility
         extrap_sym = :constant
     elseif extrapolation == "NA"
-        # Map old "NA" to "missing" for backwards compatibility
         extrap_sym = :missing
     elseif !(extrap_sym in (:constant, :linear, :missing, :error))
         throw(ArgumentError("Extrapolation must be 'constant', 'linear', 'missing', or 'error', got: $extrapolation"))
@@ -116,18 +114,26 @@ struct Interpolator{TX,TY}
     y::TY
     method::Symbol
     extrap::Symbol
-    
+
     function Interpolator(x, y; method=:linear, extrap=:constant)
-        @assert length(x) == length(y) "x and y must have same length"
-        @assert issorted(x) "x must be sorted"
-        @assert method in (:linear, :constant) "method must be :linear or :constant"
-        @assert extrap in (:constant, :linear, :missing, :error) "extrap must be :constant, :linear, :missing, or :error"
-        
+        if length(x) != length(y)
+            throw(ArgumentError("x and y must have same length"))
+        end
+        if !issorted(x)
+            throw(ArgumentError("x must be sorted"))
+        end
+        if !(method in (:linear, :constant))
+            throw(ArgumentError("method must be :linear or :constant"))
+        end
+        if !(extrap in (:constant, :linear, :missing, :error))
+            throw(ArgumentError("extrap must be :constant, :linear, :missing, or :error"))
+        end
+
         # Validate extrap is compatible with method
         if method == :constant && extrap == :linear
             error("Linear extrapolation is not supported for constant interpolation")
         end
-        
+
         new{typeof(x), typeof(y)}(x, y, method, extrap)
     end
 end
@@ -149,7 +155,7 @@ end
 # Internal linear interpolation
 function _linear_interp(interp::Interpolator, x)
     idx = searchsortedlast(interp.x, x)
-    
+
     # Handle extrapolation
     if idx == 0
         if interp.extrap == :constant
@@ -178,7 +184,7 @@ function _linear_interp(interp::Interpolator, x)
             error("x=$x is above range [$(first(interp.x)), $(last(interp.x))]")
         end
     end
-    
+
     # Interpolate
     x1, x2 = interp.x[idx], interp.x[idx+1]
     y1, y2 = interp.y[idx], interp.y[idx+1]
@@ -189,7 +195,7 @@ end
 # Internal constant interpolation
 function _constant_interp(interp::Interpolator, x)
     idx = searchsortedlast(interp.x, x)
-    
+
     # Handle extrapolation
     if idx == 0
         if interp.extrap == :constant
@@ -200,7 +206,7 @@ function _constant_interp(interp::Interpolator, x)
             error("x=$x is below range [$(first(interp.x)), $(last(interp.x))]")
         end
     end
-    
+
     idx = clamp(idx, 1, length(interp.y))
     return interp.y[idx]
 end
@@ -209,19 +215,8 @@ end
 # Signal Generation Functions
 # ============================================================================
 
-_zero_with_unit(x) = isa(x, Unitful.Quantity) ? zero(x) : 0.0
-
-_normalize_time_arg(times, time_units, value) = begin
-    normalized = convert_u(value, time_units)
-    if eltype(times) <: Unitful.Quantity
-        return normalized
-    end
-
-    return Unitful.ustrip(normalized)
-end
-
 """
-    make_ramp(time_units, times, start, finish, height=1.0)
+    make_ramp(times, start, finish, height=1.0)
 
 Create a ramp signal that linearly increases from 0 to `height` between `start` and `finish` times.
 
@@ -229,8 +224,7 @@ The ramp starts at height 0 at time `start`, increases linearly, and reaches `he
 Outside this range, the value is constant (0 before start, height after finish).
 
 # Arguments
-- `time_units`: Units for time (e.g., u"yr", u"d")
-- `times`: Time vector or range (start, end)
+- `times`: Time vector or range [start, end]
 - `start`: Start time of ramp
 - `finish`: End time of ramp
 - `height=1.0`: Maximum height of ramp (can be negative for decreasing ramp)
@@ -240,39 +234,28 @@ Outside this range, the value is constant (0 before start, height after finish).
 
 # Examples
 ```julia
-julia> r = make_ramp(u"yr", [0.0, 10.0], 2.0, 5.0, 10.0)
+julia> r = make_ramp([0.0, 10.0], 2.0, 5.0, 10.0)
 julia> r(3.5)  # Halfway through ramp
 5.0
 ```
 """
-function make_ramp(time_units, times, start, finish, height=1.0)
+function make_ramp(times, start, finish, height=1.0)
     @assert start < finish "The finish time of the ramp cannot be before the start time. To specify a decreasing ramp, set the height to a negative value."
 
-    # Normalize units between times and ramp parameters
-    start, finish = _normalize_time_units(times, time_units, start, finish)
-    
-    # Initialize with the same unit type as height when applicable
-    start_h_ramp = _zero_with_unit(height)
-    add_y = _zero_with_unit(height)
-
     if start > last(times)
-        # If the pulse starts after the end of the time range, return a zero function    
-        func = itp(times, [add_y; add_y], method="constant", extrapolation="nearest")
+        func = itp(times, [0.0; 0.0], method="constant", extrapolation="nearest")
         return func
     elseif finish < first(times)
-        # If the ramp finishes before the start of the time range, return a constant height function
         func = itp(times, [height; height], method="constant", extrapolation="nearest")
         return func
-    end   
-       
+    end
 
     x = [start, finish]
-    y = [start_h_ramp, height]
+    y = [0.0, height]
 
-    # If the ramp is after the start time, add a zero at the start
-    if start > first(times) || finish < first(times)
+    if start > first(times)
         x = [first(times); x]
-        y = [add_y; y]
+        y = [0.0; y]
     end
 
     func = itp(x, y, method="linear", extrapolation="nearest")
@@ -280,12 +263,11 @@ function make_ramp(time_units, times, start, finish, height=1.0)
 end
 
 """
-    make_step(time_units, times, start, height=1.0)
+    make_step(times, start, height=1.0)
 
 Create a step signal that jumps from 0 to `height` at time `start`.
 
 # Arguments
-- `time_units`: Units for time
 - `times`: Time vector or range
 - `start`: Time when step occurs
 - `height=1.0`: Height of step
@@ -295,32 +277,25 @@ Create a step signal that jumps from 0 to `height` at time `start`.
 
 # Examples
 ```julia
-julia> s = make_step(u"s", [0.0, 10.0], 5.0, 2.0)
-julia> s(4.9)  # Before step 
+julia> s = make_step([0.0, 10.0], 5.0, 2.0)
+julia> s(4.9)  # Before step
 0.0
 julia> s(5.1)  # After step
 2.0
 ```
 """
-function make_step(time_units, times, start, height=1.0)
-    # Normalize units
-    start = _normalize_single_time(times, time_units, start)
-    
-    add_y = _zero_with_unit(height)
-
-    # If the step starts after the end of the time range, return a zero function    
+function make_step(times, start, height=1.0)
     if start > last(times)
-        func = itp(times, [add_y; add_y], method="constant", extrapolation="nearest")
+        func = itp(times, [0.0; 0.0], method="constant", extrapolation="nearest")
         return func
-    end   
+    end
 
-    x = [start, times[2]]
+    x = [start, last(times)]
     y = [height, height]
 
-    # If the step is after the start time, add a zero at the start
     if start > first(times)
         x = [first(times); x]
-        y = [add_y; y]
+        y = [0.0; y]
     end
 
     func = itp(x, y, method="constant", extrapolation="nearest")
@@ -328,16 +303,15 @@ function make_step(time_units, times, start, height=1.0)
 end
 
 """
-    make_pulse(time_units, times, start, height=1.0, width=1.0*time_units, repeat_interval=nothing)
+    make_pulse(times, start, height=1.0, width=1.0, repeat_interval=nothing)
 
 Create a pulse signal with specified width and optional repetition.
 
 # Arguments
-- `time_units`: Units for time
 - `times`: Time vector or range
 - `start`: Start time of first pulse
 - `height=1.0`: Height of pulse
-- `width=1.0*time_units`: Duration of each pulse
+- `width=1.0`: Duration of each pulse
 - `repeat_interval=nothing`: Time between pulse starts (nothing = single pulse)
 
 # Returns
@@ -345,66 +319,51 @@ Create a pulse signal with specified width and optional repetition.
 
 # Examples
 ```julia
-julia> p = make_pulse(u"s", [0.0, 20.0], 5.0, 1.0, 2.0, 10.0)  # Pulse every 10s
+julia> p = make_pulse([0.0, 20.0], 5.0, 1.0, 2.0, 10.0)  # Pulse every 10s
 julia> p(6.0)  # During first pulse
 1.0
 julia> p(8.0)  # Between pulses
 0.0
 ```
 """
-function make_pulse(time_units, times, start, height=1.0, width=1.0 * time_units, repeat_interval=nothing)
-    # Validate width
-    width_value = Unitful.ustrip(convert_u(width, time_units))
-    if width_value <= 0.0
+function make_pulse(times, start, height=1.0, width=1.0, repeat_interval=nothing)
+    if width <= 0.0
         throw(ArgumentError("The width of the pulse cannot be equal to or less than 0; to indicate an 'instantaneous' pulse, specify the simulation step size (dt)."))
     end
 
-    # Normalize units
-    start, width, repeat_interval = _normalize_pulse_units(times, time_units, start, width, repeat_interval)
-
-    add_y = _zero_with_unit(height)
-
     if start > last(times)
-        # If the pulse starts after the end of the time range, return a zero function    
-        func = itp(times, [add_y; add_y], method="constant", extrapolation="nearest")
+        func = itp(times, [0.0; 0.0], method="constant", extrapolation="nearest")
         return func
-    end   
+    end
 
-    # Define start and end times of pulses
     last_time = last(times)
 
     if isnothing(repeat_interval)
-        # Single pulse
         signal_times = [start; start + width]
-        signal_y = [height; add_y]
-    else 
-
+        signal_y = [height; 0.0]
+    else
         start_ts = collect(start:repeat_interval:last_time)
 
-        # When width is equal or greater than repeat interval, it's basically continuously 1
         if width >= repeat_interval
             signal_times = [start_ts; ]
             signal_y = [fill(height, length(start_ts)); ]
         else
-            # Build signal as vectors of times and y-values
             end_ts = start_ts .+ width
             signal_times = [start_ts; end_ts]
-            signal_y = [fill(height, length(start_ts)); fill(add_y, length(end_ts))]
+            signal_y = [fill(height, length(start_ts)); fill(0.0, length(end_ts))]
         end
     end
 
-    # Add zeros at boundaries if needed
     if minimum(signal_times) > first(times)
         signal_times = [first(times); signal_times]
-        signal_y = [add_y; signal_y]
+        signal_y = [0.0; signal_y]
     end
 
     if maximum(signal_times) < last_time
         signal_times = [signal_times; last_time]
-        signal_y = [signal_y; add_y]
+        signal_y = [signal_y; 0.0]
     end
 
-    # Sort by time
     perm = sortperm(signal_times)
     x = signal_times[perm]
     y = signal_y[perm]
@@ -414,7 +373,7 @@ function make_pulse(time_units, times, start, height=1.0, width=1.0 * time_units
 end
 
 """
-    make_seasonal(times, dt, period=u"1yr", shift=u"0yr")
+    make_seasonal(dt, times, period=1.0, shift=0.0)
 
 Create a seasonal cosine wave with specified period and phase shift.
 
@@ -423,95 +382,30 @@ The wave oscillates between -1 and 1 with the formula: cos(2π(t - shift)/period
 # Arguments
 - `dt`: Time step for sampling
 - `times`: Time range [start, end]
-- `period=u"1yr"`: Period of oscillation
-- `shift=u"0yr"`: Phase shift (positive = delay)
+- `period=1.0`: Period of oscillation
+- `shift=0.0`: Phase shift (positive = delay)
 
 # Returns
 - Interpolation function representing the seasonal pattern
 
 # Examples
 ```julia
-julia> wave = make_seasonal(0.1u"yr", [0.0u"yr", 2.0u"yr"], 1.0u"yr")
-julia> wave(0.0u"yr")  # Peak of cosine
+julia> wave = make_seasonal(0.1, [0.0, 2.0], 1.0)
+julia> wave(0.0)  # Peak of cosine
 1.0
-julia> wave(0.5u"yr")  # Trough
+julia> wave(0.5)  # Trough
 -1.0
 ```
 """
-function make_seasonal(dt, times, period=u"1yr", shift=u"0yr")
-    @assert Unitful.ustrip(period) > 0 "The period of the seasonal wave must be greater than 0."
+function make_seasonal(dt, times, period=1.0, shift=0.0)
+    @assert period > 0 "The period of the seasonal wave must be greater than 0."
 
     time_vec = times[1]:dt:times[2]
-    if isa(first(time_vec), Unitful.Quantity) || isa(period, Unitful.Quantity) || isa(shift, Unitful.Quantity)
-        time_num = Unitful.ustrip.(time_vec)
-        shift_num = isa(shift, Unitful.Quantity) ? Unitful.ustrip(shift) : shift
-        period_num = isa(period, Unitful.Quantity) ? Unitful.ustrip(period) : period
-        phase = 2 * pi .* (time_num .- shift_num) ./ period_num
-    else
-        phase = 2 * pi .* (time_vec .- shift) ./ period
-    end
+    phase = 2 * pi .* (time_vec .- shift) ./ period
     y = cos.(phase)
     func = itp(time_vec, y, method="linear", extrapolation="nearest")
 
     return func
-end
-
-# ============================================================================
-# Helper Functions for Unit Conversion
-# ============================================================================
-
-"""
-    _normalize_time_units(times, time_units, start, finish)
-
-Internal helper to normalize time units between simulation times and signal parameters.
-"""
-function _normalize_time_units(times, time_units, start, finish)
-    if eltype(times) <: Unitful.Quantity
-        # Times have units, ensure start/finish match
-        start = convert_u(start, time_units)
-        finish = convert_u(finish, time_units)
-    else
-        # Times are unitless, coerce through time_units and strip to numeric values
-        start = _normalize_time_arg(times, time_units, start)
-        finish = _normalize_time_arg(times, time_units, finish)
-    end
-    return start, finish
-end
-
-"""
-    _normalize_single_time(times, time_units, start)
-
-Internal helper to normalize a single time value.
-"""
-function _normalize_single_time(times, time_units, start)
-    if eltype(times) <: Unitful.Quantity
-        start = convert_u(start, time_units)
-    else
-        start = _normalize_time_arg(times, time_units, start)
-    end
-    return start
-end
-
-"""
-    _normalize_pulse_units(times, time_units, start, width, repeat_interval)
-
-Internal helper to normalize time units for pulse signals.
-"""
-function _normalize_pulse_units(times, time_units, start, width, repeat_interval)
-    if eltype(times) <: Unitful.Quantity
-        start = convert_u(start, time_units)
-        width = convert_u(width, time_units)
-        if !isnothing(repeat_interval)
-            repeat_interval = convert_u(repeat_interval, time_units)
-        end
-    else
-        start = _normalize_time_arg(times, time_units, start)
-        width = _normalize_time_arg(times, time_units, width)
-        if !isnothing(repeat_interval)
-            repeat_interval = _normalize_time_arg(times, time_units, repeat_interval)
-        end
-    end
-    return start, width, repeat_interval
 end
 
 # ============================================================================
@@ -539,8 +433,7 @@ julia> round_IM(2.5)
 function round_IM(x::Real, digits::Int=0)
     scaled_x = x * 10.0^digits
     frac = scaled_x % 1
-    
-    # Check if fractional part is exactly ±0.5
+
     if abs(frac) == 0.5
         return ceil(scaled_x) / 10.0^digits
     else
@@ -602,16 +495,451 @@ julia> logistic(5.0, 2.0, 5.0, 10.0)  # Steeper curve, shifted
 ```
 """
 function logistic(x, slope=1.0, midpoint=0.0, upper=1.0)
-    @assert isfinite(Unitful.ustrip(slope)) && isfinite(Unitful.ustrip(midpoint)) && isfinite(Unitful.ustrip(upper)) "slope, midpoint, and upper must be finite numeric values"
+    @assert isfinite(slope) && isfinite(midpoint) && isfinite(upper) "slope, midpoint, and upper must be finite numeric values"
     return upper / (1 + exp(-slope * (x - midpoint)))
+end
+
+"""
+    hill(x, slope=1.0, midpoint=0.5, upper=1.0)
+
+Compute the Hill function with configurable slope, midpoint, and upper asymptote.
+
+Formula: upper * x^slope / (midpoint^slope + x^slope)
+
+At x = midpoint the function returns exactly upper / 2.
+
+# Arguments
+- `x`: Input value (typically ≥ 0)
+- `slope=1.0`: Hill coefficient controlling steepness; curve is S-shaped when slope > 1
+- `midpoint=0.5`: x-value at which the output equals upper / 2 (EC50)
+- `upper=1.0`: Maximum asymptotic value
+
+# Examples
+```julia
+julia> hill(1.0, 1.0, 1.0, 1.0)   # At midpoint → upper/2
+0.5
+julia> hill(2.0, 2.0, 2.0, 10.0)  # Steeper, different scale
+5.0
+```
+"""
+function hill(x, slope=1.0, midpoint=0.5, upper=1.0)
+    @assert isfinite(slope) && isfinite(midpoint) && isfinite(upper) "slope, midpoint, and upper must be finite numeric values"
+    return upper * x^slope / (midpoint^slope + x^slope)
+end
+
+"""
+    r_min(x::Number)
+    r_min(c)
+    r_min(args...)
+
+Return the minimum value, R-style.
+
+When called with a single scalar, returns it unchanged. When called with a
+single collection (vector, tuple, range, array, or any iterable), returns the
+scalar minimum of all elements (equivalent to Julia's `minimum`). When called
+with multiple scalar arguments, delegates to `Base.min`.
+
+Avoids type piracy on `Base.min` while matching R's `min()` behaviour.
+
+# Examples
+```julia
+julia> r_min([3.0, 1.0, 2.0])
+1.0
+julia> r_min((0.0, 182.5))
+0.0
+julia> r_min(3.0, 1.0, 2.0)
+1.0
+julia> r_min(5.0)
+5.0
+```
+"""
+r_min(x::Number)         = x
+r_min(c)                 = minimum(c)
+r_min(args...)           = Base.min(args...)
+
+"""
+    r_max(x::Number)
+    r_max(c)
+    r_max(args...)
+
+Return the maximum value, R-style.
+
+When called with a single scalar, returns it unchanged. When called with a
+single collection (vector, tuple, range, array, or any iterable), returns the
+scalar maximum of all elements (equivalent to Julia's `maximum`). When called
+with multiple scalar arguments, delegates to `Base.max`.
+
+Avoids type piracy on `Base.max` while matching R's `max()` behaviour.
+
+# Examples
+```julia
+julia> r_max([3.0, 1.0, 2.0])
+3.0
+julia> r_max((0.0, 182.5))
+182.5
+julia> r_max(3.0, 1.0, 2.0)
+3.0
+julia> r_max(5.0)
+5.0
+```
+"""
+r_max(x::Number)         = x
+r_max(c)                 = maximum(c)
+r_max(args...)           = Base.max(args...)
+
+"""
+    r_diff(x, lag = 1, differences = 1)
+
+Return lagged and iterated differences, R-style.
+
+Mirrors R's `diff()`: starting from `x`, compute `differences` successive
+rounds of differencing, where each round subtracts elements `lag` positions
+apart (`x[i+lag] - x[i]`). With the defaults (`lag = 1`, `differences = 1`)
+this is equivalent to Julia's `Base.diff`.
+
+The result is shorter than the input by `lag * differences` elements. If the
+input is not long enough, an empty vector is returned (matching R).
+
+# Examples
+```julia
+julia> r_diff([1, 3, 6, 10])
+3-element Vector{Int64}:
+ 2
+ 3
+ 4
+julia> r_diff([1, 3, 6, 10], 2)
+2-element Vector{Int64}:
+ 5
+ 7
+julia> r_diff([1, 3, 6, 10], 1, 2)
+2-element Vector{Int64}:
+ 1
+ 1
+```
+"""
+function r_diff(x::AbstractVector, lag::Real = 1, differences::Real = 1)
+    # `lag`/`differences` are accepted as Real (the converter may pass float
+    # literals) and converted to Int; R's diff(x, lag, differences) is positional.
+    li = Int(lag)
+    di = Int(differences)
+    li >= 1 || throw(ArgumentError("`lag` must be >= 1, got $li"))
+    di >= 1 || throw(ArgumentError("`differences` must be >= 1, got $di"))
+    r = x
+    for _ in 1:di
+        length(r) > li || return r[1:0]
+        r = r[(li + 1):end] .- r[1:(end - li)]
+    end
+    return r
+end
+
+"""
+    r_as_logical(x)
+
+Convert to a logical value, R-style.
+
+Mirrors R's `as.logical()`: any nonzero number is `true` and zero is `false`
+(unlike Julia's `Bool`, which errors on values other than 0/1). Strings such as
+`"TRUE"`, `"T"`, `"FALSE"`, `"F"` (any capitalization R accepts) convert to the
+corresponding `Bool`; unrecognized strings yield `missing` (as R returns `NA`).
+`missing` is returned unchanged. Broadcast with `r_as_logical.(x)` for vectors.
+
+# Examples
+```julia
+julia> r_as_logical(2)
+true
+julia> r_as_logical(0)
+false
+julia> r_as_logical("TRUE")
+true
+```
+"""
+r_as_logical(x::Bool)            = x
+r_as_logical(x::Real)            = !iszero(x)
+r_as_logical(::Missing)          = missing
+function r_as_logical(x::AbstractString)
+    s = strip(x)
+    s in ("TRUE", "true", "True", "T")  ? true  :
+    s in ("FALSE", "false", "False", "F") ? false : missing
+end
+
+"""
+    r_grep(pattern, x, ignore_case=false, perl=false, value=false,
+           fixed=false, useBytes=false, invert=false)
+
+Search for `pattern` in the elements of `x`, R-style.
+
+Mirrors R's `grep()`: by default returns the integer indices of the elements of
+`x` that match `pattern` (a regular expression unless `fixed = true`). With
+`value = true` the matching elements themselves are returned; with
+`invert = true` the non-matching elements are selected; `ignore_case = true`
+makes matching case-insensitive. The `perl` and `useBytes` arguments are
+accepted for signature compatibility but ignored.
+
+# Examples
+```julia
+julia> r_grep("a", ["apple", "berry", "avocado"])
+2-element Vector{Int64}:
+ 1
+ 3
+julia> r_grep("a", ["apple", "berry", "avocado"]; value = true)
+2-element Vector{String}:
+ "apple"
+ "avocado"
+```
+"""
+function r_grep(pattern, x, ignore_case = false, perl = false, value = false,
+                fixed = false, useBytes = false, invert = false)
+    if fixed
+        needle = ignore_case ? lowercase(pattern) : pattern
+        test = s -> occursin(needle, ignore_case ? lowercase(s) : s)
+    else
+        rx = ignore_case ? Regex(pattern, "i") : Regex(pattern)
+        test = s -> occursin(rx, s)
+    end
+    idx = findall(s -> invert ? !test(s) : test(s), x)
+    return value ? x[idx] : idx
+end
+
+"""
+    r_rbind(args...)
+
+Bind arguments together by rows, R-style.
+
+Mirrors R's `rbind()`: vectors become the rows of the resulting matrix
+(`r_rbind([1, 2], [3, 4])` is a 2×2 matrix), matrices are stacked vertically,
+and scalars become 1×1 rows. This differs from `vcat`, which would concatenate
+vectors into a single long vector instead of stacking them as rows.
+
+# Examples
+```julia
+julia> r_rbind([1, 2, 3], [4, 5, 6])
+2×3 Matrix{Int64}:
+ 1  2  3
+ 4  5  6
+```
+"""
+r_rbind(args...) = reduce(vcat, map(_as_row, args))
+_as_row(a::AbstractMatrix) = a
+_as_row(a::AbstractVector) = permutedims(a)
+_as_row(a)                 = permutedims([a])
+
+"""
+    r_upper_tri(x, diag=false)
+    r_lower_tri(x, diag=false)
+
+Return a logical matrix marking the upper (or lower) triangle of `x`, R-style.
+
+Mirrors R's `upper.tri()`/`lower.tri()`: the result is a `Bool` matrix that is
+`true` in the upper (lower) triangle and `false` elsewhere. When `diag = true`
+the diagonal is included. This differs from `LinearAlgebra.UpperTriangular`,
+which returns a view of the *values* rather than a logical mask.
+
+# Examples
+```julia
+julia> r_upper_tri(zeros(3, 3))
+3×3 Matrix{Bool}:
+ 0  1  1
+ 0  0  1
+ 0  0  0
+```
+"""
+function r_upper_tri(x::AbstractMatrix, diag::Bool = false)
+    m, n = size(x)
+    return Bool[diag ? (j >= i) : (j > i) for i in 1:m, j in 1:n]
+end
+function r_lower_tri(x::AbstractMatrix, diag::Bool = false)
+    m, n = size(x)
+    return Bool[diag ? (j <= i) : (j < i) for i in 1:m, j in 1:n]
+end
+
+"""
+    r_na_omit(x)
+
+Remove missing values, R-style.
+
+Mirrors R's `na.omit()`: returns a new vector with `missing` elements removed.
+Unlike `Base.skipmissing`, which returns a lazy iterator, this eagerly collects
+into a vector so the result supports indexing, `length`, concatenation, etc.
+
+# Examples
+```julia
+julia> r_na_omit([1, missing, 3])
+2-element Vector{Int64}:
+ 1
+ 3
+```
+"""
+r_na_omit(x) = collect(skipmissing(x))
+
+"""
+    r_range(x)
+    r_range(args...)
+
+Return the minimum and maximum, R-style.
+
+Mirrors R's `range()`: returns a 2-element vector `[min, max]`. With a single
+collection it spans that collection; with multiple scalar arguments it spans
+those values. This differs from `Base.extrema`, which returns a `(min, max)`
+tuple.
+
+# Examples
+```julia
+julia> r_range([3.0, 1.0, 2.0])
+2-element Vector{Float64}:
+ 1.0
+ 3.0
+julia> r_range(4, 2, 7)
+2-element Vector{Int64}:
+ 2
+ 7
+```
+"""
+r_range(x) = [minimum(x), maximum(x)]
+function r_range(x::Number, rest::Number...)
+    v = (x, rest...)
+    return [minimum(v), maximum(v)]
+end
+
+"""
+    r_match(x, table)
+
+Return the positions of (first) matches of `x` in `table`, R-style.
+
+Mirrors R's `match()`: for each element of `x`, returns the index of its first
+occurrence in `table`, or `missing` if absent (R returns `NA`). This is distinct
+from Julia's `Base.match`, which performs regular-expression matching.
+
+# Examples
+```julia
+julia> r_match(["b", "d", "a"], ["a", "b", "c"])
+3-element Vector{Union{Missing, Int64}}:
+ 2
+  missing
+ 1
+```
+"""
+r_match(x::AbstractVector, table) =
+    [(i = findfirst(==(xi), table); i === nothing ? missing : i) for xi in x]
+r_match(x, table) = (i = findfirst(==(x), table); i === nothing ? missing : i)
+
+"""
+    r_sort(x, decreasing=false)
+
+Sort a collection, R-style.
+
+Mirrors R's `sort()`: ascending by default, descending when `decreasing=true`.
+This wrapper exists because R's `decreasing` argument maps to Julia's `rev`
+keyword, which the converter cannot express directly.
+
+# Examples
+```julia
+julia> r_sort([3, 1, 2])
+3-element Vector{Int64}:
+ 1
+ 2
+ 3
+julia> r_sort([3, 1, 2], true)
+3-element Vector{Int64}:
+ 3
+ 2
+ 1
+```
+"""
+r_sort(x, decreasing::Bool = false) = sort(x; rev = decreasing)
+
+"""
+    r_rowsums(m)
+    r_colsums(m)
+    r_rowmeans(m)
+    r_colmeans(m)
+
+Row/column sums and means of a matrix, R-style.
+
+Mirror R's `rowSums()`/`colSums()`/`rowMeans()`/`colMeans()`: each returns a
+plain **vector**. This differs from `sum(m; dims=...)` / `mean(m; dims=...)`,
+which keep the reduced dimension (returning a 1×n or n×1 matrix).
+
+# Examples
+```julia
+julia> r_rowsums([1 2; 3 4])
+2-element Vector{Int64}:
+ 3
+ 7
+```
+"""
+r_rowsums(m::AbstractMatrix)  = vec(sum(m, dims = 2))
+r_colsums(m::AbstractMatrix)  = vec(sum(m, dims = 1))
+r_rowmeans(m::AbstractMatrix) = vec(sum(m, dims = 2)) ./ size(m, 2)
+r_colmeans(m::AbstractMatrix) = vec(sum(m, dims = 1)) ./ size(m, 1)
+
+"""
+    r_cummax(x)
+    r_cummin(x)
+
+Cumulative maximum / minimum, R-style.
+
+Mirror R's `cummax()`/`cummin()`: element `i` of the result is the max/min of
+`x[1:i]`. (Base Julia has `cumsum`/`cumprod` but no `cummax`/`cummin`.)
+
+# Examples
+```julia
+julia> r_cummax([1, 3, 2, 5, 4])
+5-element Vector{Int64}:
+ 1
+ 3
+ 3
+ 5
+ 5
+```
+"""
+r_cummax(x) = accumulate(max, x)
+r_cummin(x) = accumulate(min, x)
+
+"""
+    r_rep(x, times=1, length_out=-1, each=1)
+
+Replicate elements of `x`, R-style.
+
+Mirrors R's `rep()` for the common scalar forms. `each` repeats every element in
+place; `times` tiles the whole (post-`each`) sequence; `length_out` (when `>= 0`)
+recycles/truncates to that length and takes precedence over `times`. Arguments
+are positional to match how the converter emits them.
+
+# Examples
+```julia
+julia> r_rep([1, 2], 3)
+6-element Vector{Int64}:
+ 1
+ 2
+ 1
+ 2
+ 1
+ 2
+julia> r_rep([1, 2], 1, -1, 2)   # each = 2
+4-element Vector{Int64}:
+ 1
+ 1
+ 2
+ 2
+```
+"""
+function r_rep(x, times::Real = 1, length_out::Real = -1, each::Real = 1)
+    t = Int(times)
+    lo = Int(length_out)
+    e = Int(each)
+    base = x isa AbstractArray ? vec(collect(x)) : [x]
+    y = e > 1 ? repeat(base, inner = e) : base
+    if lo >= 0
+        isempty(y) && return y
+        return [y[((i - 1) % length(y)) + 1] for i in 1:lo]
+    end
+    return t == 1 ? y : repeat(y, t)
 end
 
 """
     nonnegative(x)
 
 Ensure value(s) are non-negative by returning max(0, x).
-
-Works with scalars, arrays, and Unitful quantities.
 
 # Examples
 ```julia
@@ -624,9 +952,7 @@ julia> nonnegative([-1, 2, -3])
 ```
 """
 nonnegative(x::Real) = max(0.0, x)
-nonnegative(x::Unitful.Quantity) = max(0.0, Unitful.ustrip(x)) * Unitful.unit(x)
 nonnegative(x::AbstractArray{<:Real}) = max.(0.0, x)
-nonnegative(x::AbstractArray{<:Unitful.Quantity}) = max.(0.0, Unitful.ustrip.(x)) .* Unitful.unit.(x)
 
 # ============================================================================
 # Rounding Utilities
@@ -635,20 +961,18 @@ nonnegative(x::AbstractArray{<:Unitful.Quantity}) = max.(0.0, Unitful.ustrip.(x)
 """
     round_(x, digits=0)
 
-Flexible rounding function that handles both regular numbers and Unitful quantities.
+Flexible rounding function.
 
 # Examples
 ```julia
 julia> round_(3.14159, digits=2)
 3.14
-julia> round_(5.6u"m", digits=0)
-6.0 m
+julia> round_(3.14159, 2)
+3.14
 ```
 """
 round_(x, digits::Real) = round(x, digits=round(Int, digits))
 round_(x; digits::Real=0) = round(x, digits=round(Int, digits))
-round_(x::Unitful.Quantity, digits::Real) = round(Unitful.ustrip(x), digits=round(Int, digits)) * Unitful.unit(x)
-round_(x::Unitful.Quantity; digits::Real=0) = round(Unitful.ustrip(x), digits=round(Int, digits)) * Unitful.unit(x)
 
 # ============================================================================
 # Random Sampling Functions
@@ -692,18 +1016,88 @@ function rdist(a::Vector{T}, b::Vector{<:Real}) where T
     if length(a) != length(b)
         throw(ArgumentError("Length of a and b must match"))
     end
-    
+
     if any(x -> x < 0, b)
         throw(ArgumentError("All probabilities must be non-negative"))
     end
-    
+
     b_sum = sum(b)
     if b_sum <= 0
         throw(ArgumentError("Sum of probabilities must be positive"))
     end
-    
+
     b_normalized = b / b_sum
     return a[rand(Distributions.Categorical(b_normalized))]
+end
+
+"""
+    with_rng(f, src)
+
+Run `f()` with the task-local default RNG temporarily set from `src` — an
+integer seed, a `Xoshiro`, or the `TaskLocalRNG` itself — then restore the
+caller's RNG state. Inside `f`, bare `rand()` / `randn()` (and functions built
+on them, e.g. [`rbool`](@ref), [`rdist`](@ref)) draw from the installed stream;
+no rng argument is threaded through.
+
+For a seed or a `Xoshiro`, the caller's global RNG state is saved before `f`
+runs and restored afterwards, even if `f` throws. A `Xoshiro` passed as `src`
+is not mutated.
+
+Passing a `TaskLocalRNG` (i.e. `Random.default_rng()`) is a no-op passthrough:
+it *is* the task-local stream, so bare `rand()`/`randn()` already draw from it
+and there is nothing to install or restore. This is the case for the per-trajectory
+`ctx.rng` of a SciML `EnsembleProblem` (new `prob_func(prob, ctx)` interface),
+which SciML has already seeded for the trajectory — so `with_rng(ctx.rng) do … end`
+runs `f` against that already-installed stream and advances it normally.
+
+Any other `AbstractRNG` (e.g. `MersenneTwister`) is rejected: routing bare
+`rand()`/`randn()` through it is not possible because the task-local default
+RNG is a `Xoshiro`. For those, call `rand(rng, …)` / `randn(rng, …)` explicitly.
+
+# Examples
+```julia
+julia> with_rng(() -> rand(3), 1234) == with_rng(() -> rand(3), 1234)
+true
+
+julia> Random.seed!(99); before = rand(2);
+
+julia> with_rng(() -> rand(5), 1234);  # isolated; does not advance global stream
+
+julia> Random.seed!(99); rand(2) == before
+true
+```
+"""
+function with_rng(f, seed::Integer)
+    rng   = Random.default_rng()
+    saved = copy(rng)
+    Random.seed!(rng, seed)
+    try
+        return f()
+    finally
+        copy!(rng, saved)
+    end
+end
+
+function with_rng(f, src::Xoshiro)
+    rng   = Random.default_rng()
+    saved = copy(rng)
+    copy!(rng, src)            # install src's state; src itself is not mutated
+    try
+        return f()
+    finally
+        copy!(rng, saved)
+    end
+end
+
+# The task-local default RNG is a singleton: when it is handed to us (e.g. an
+# ensemble's per-trajectory ctx.rng, already seeded by SciML) bare rand()/randn()
+# already draw from it, so there is nothing to install or restore — just run f().
+with_rng(f, ::Random.TaskLocalRNG) = f()
+
+function with_rng(f, src::AbstractRNG)
+    error("with_rng can route bare rand()/randn() only through a seed, a Xoshiro, or " *
+          "the TaskLocalRNG (the task-local default RNG). For a $(typeof(src)), pass a " *
+          "seed/Xoshiro, or call rand(rng, …) / randn(rng, …) explicitly with your $(typeof(src)).")
 end
 
 # ============================================================================
@@ -782,5 +1176,23 @@ julia> 10 ⊕ 5
 ```
 """
 ⊕(x, y) = mod(x, y)
+
+"""
+    ⊘(x, y)
+
+Floor division operator (floor(x / y)).
+
+Unicode alternative to `fld(x, y)`, matching R's `%/%` (floored, so the result
+follows the sign of the divisor: `-7 ⊘ 2 == -4`).
+
+# Examples
+```julia
+julia> 7 ⊘ 2
+3
+julia> -7 ⊘ 2
+-4
+```
+"""
+⊘(x, y) = fld(x, y)
 
 end # module
