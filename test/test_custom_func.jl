@@ -234,8 +234,11 @@ using SystemDynamicsBuildR.custom_func
         end
 
         @testset "seasonal - basic wave" begin
-            times = [0.0, 2.0]
-            wave = make_seasonal(0.1, times, 1.0, 0.0)
+            # Signature mirrors R seasonal(times, period, shift); the converter
+            # emits make_seasonal(times, period, shift) where times is the
+            # (start, stop) tuple. The closure is exact (no dt / sampling).
+            times = (0.0, 2.0)
+            wave = make_seasonal(times, 1.0, 0.0)
 
             @test wave(0.0) ≈ 1.0   # Peak
             @test wave(0.25) ≈ 0.0 atol=0.01  # Zero crossing
@@ -245,17 +248,17 @@ using SystemDynamicsBuildR.custom_func
         end
 
         @testset "seasonal - with phase shift" begin
-            times = [0.0, 2.0]
-            wave = make_seasonal(0.1, times, 1.0, 0.25)
+            times = (0.0, 2.0)
+            wave = make_seasonal(times, 1.0, 0.25)
 
             @test wave(0.0) ≈ 0.0 atol=0.01   # Shifted by quarter period
             @test wave(0.25) ≈ 1.0 atol=0.1   # Peak at shifted position
         end
 
         @testset "seasonal - period validation" begin
-            times = [0.0, 2.0]
-            @test_throws AssertionError make_seasonal(0.1, times, 0.0)
-            @test_throws AssertionError make_seasonal(0.1, times, -1.0)
+            times = (0.0, 2.0)
+            @test_throws AssertionError make_seasonal(times, 0.0)
+            @test_throws AssertionError make_seasonal(times, -1.0)
         end
     end
 
@@ -331,6 +334,89 @@ using SystemDynamicsBuildR.custom_func
             @test_throws AssertionError hill(1.0, Inf, 1.0, 1.0)
             @test_throws AssertionError hill(1.0, 1.0, Inf, 1.0)
             @test_throws AssertionError hill(1.0, 1.0, 1.0, Inf)
+        end
+
+        @testset "ricker function" begin
+            # NOTE: ricker uses POSITIONAL args (location, upper, shape, a, b) to
+            # match the R signature order, because sdbuildR's R->Julia translation
+            # drops argument names and emits positional calls (e.g. ricker(x, 2, 10, 1)).
+
+            # Peaks at x = location with value upper
+            @test ricker(1, 1, 1) ≈ 1 atol=1e-9
+            @test ricker(2, 2, 5) ≈ 5 atol=1e-9
+            @test ricker(3, 3, 10, 2) ≈ 10 atol=1e-9
+
+            # Equals 0 at x = 0
+            @test ricker(0, 2, 5) ≈ 0 atol=1e-9
+            @test ricker(0, 1, 1, 0.5) ≈ 0 atol=1e-9
+
+            # location is the global maximum (hump shape)
+            x = collect(0:0.01:20)
+            vals = ricker(x, 4, 3, 1.5)
+            @test x[argmax(vals)] ≈ 4 atol=0.01
+            @test all(diff(vals[x .<= 4]) .>= 0)   # increasing before the peak
+            @test all(diff(vals[x .>= 4]) .<= 0)   # decreasing after the peak
+
+            # upper scales the curve
+            xs = collect(0.1:0.1:10)
+            @test ricker(xs, 2, 6) ≈ 6 .* ricker(xs, 2, 1) atol=1e-9
+
+            # shape = 1 reduces to the standard Ricker a*x*exp(-b*x)
+            location = 2; upper = 1
+            a = upper * exp(1) / location
+            b = 1 / location
+            xv = [0.5, 1, 3, 5]
+            @test ricker(xv, location, upper, 1) ≈ a .* xv .* exp.(-b .* xv) atol=1e-9
+
+            # shape = alpha matches generalized form C * x^alpha * exp(-(alpha/location)*x)
+            location = 2; upper = 3; alpha = 2.5
+            C = upper * exp(alpha) / location^alpha
+            xv = [0.5, 1, 2, 4, 6]
+            @test ricker(xv, location, upper, alpha) ≈
+                  C .* xv .^ alpha .* exp.(-(alpha / location) .* xv) atol=1e-9
+
+            # larger shape narrows the peak (smaller values off-peak)
+            x_off = 8.0  # away from the peak at location = 4
+            broad = ricker(x_off, 4, 1, 0.5)
+            base = ricker(x_off, 4, 1, 1)
+            narrow = ricker(x_off, 4, 1, 3)
+            @test narrow < base
+            @test base < broad
+
+            # Vectorized over x, and broadcastable (as sdbuildR emits ricker.(...))
+            v = ricker(collect(0:0.5:5), 2)
+            @test length(v) == 11
+            @test eltype(v) <: AbstractFloat
+            @test ricker.(collect(0:0.5:5), 2) ≈ v atol=1e-9
+
+            # a, b parameterization (positions 5 and 6) equals the standard curve at shape = 1
+            a = 2.5; b = 0.4
+            xv = [0.0, 0.5, 1, 2.5, 5, 9]
+            @test ricker(xv, 1, 1, 1, a, b) ≈ a .* xv .* exp.(-b .* xv) atol=1e-9
+
+            # a, b equals the expanded form a*x^shape*exp(-b*x) for any shape
+            a = 1.8; b = 0.6; shp = 2.5
+            xv = [0.5, 1, 2, 4, 6]
+            @test ricker(xv, 1, 1, shp, a, b) ≈ a .* xv .^ shp .* exp.(-b .* xv) atol=1e-9
+
+            # a, b maps to location = shape/b, upper = a*(location/e)^shape
+            location = shp / b
+            upper = a * (location / exp(1))^shp
+            xv = [0.5, 1, 2, 4]
+            @test ricker(xv, 1, 1, shp, a, b) ≈
+                  ricker(xv, location, upper, shp) atol=1e-9
+
+            # a, b override the (default-filled) location/upper that translation injects,
+            # so this must NOT error (mirrors ricker.(N, 1.0, 1.0, 1.0, 2.5, 0.4))
+            @test ricker(3, 1, 1, 1, 2.5, 0.4) ≈ 2.5 * 3 * exp(-0.4 * 3) atol=1e-9
+
+            # Errors on incomplete or non-numeric parameterization
+            @test_throws ArgumentError ricker(1, 1, 1, 1, 2)          # b missing
+            @test_throws ArgumentError ricker(1, 1, 1, 1, nothing, 0.5)  # a missing
+            @test_throws ArgumentError ricker(1, 1, 1, 1, "x", 0.5)   # non-numeric a
+            @test_throws ArgumentError ricker(1, 1, 1, "c")           # non-numeric shape
+            @test_throws ArgumentError ricker(1, "a")                 # non-numeric location
+            @test_throws ArgumentError ricker(1, 1, "b")             # non-numeric upper
         end
 
         @testset "r_min" begin

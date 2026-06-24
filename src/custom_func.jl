@@ -14,7 +14,7 @@ using Distributions
 using Random
 
 export itp, make_ramp, make_step, make_pulse, make_seasonal
-export round_IM, logit, expit, logistic, hill, r_min, r_max, r_diff
+export round_IM, logit, expit, logistic, hill, ricker, r_min, r_max, r_diff
 export r_as_logical, r_grep, r_rbind, r_upper_tri, r_lower_tri
 export r_na_omit, r_range, r_match, r_sort
 export r_rowsums, r_colsums, r_rowmeans, r_colmeans, r_cummax, r_cummin, r_rep
@@ -373,39 +373,41 @@ function make_pulse(times, start, height=1.0, width=1.0, repeat_interval=nothing
 end
 
 """
-    make_seasonal(dt, times, period=1.0, shift=0.0)
+    make_seasonal(times, period=1.0, shift=0.0)
 
-Create a seasonal cosine wave with specified period and phase shift.
+Create a seasonal cosine wave function that oscillates between -1 and 1 with the
+formula `cos(2π (t - shift) / period)`. The wave peaks at `t = shift` and every
+`period` thereafter.
 
-The wave oscillates between -1 and 1 with the formula: cos(2π(t - shift)/period)
+The argument order mirrors R's `seasonal(times, period, shift)` so that
+sdbuildR's R→Julia translation (which drops names and emits positional calls
+like `make_seasonal(times, period, shift)`) maps to the correct slots. Unlike the
+piecewise-linear signal builders ([`make_ramp`](@ref), [`make_step`](@ref),
+[`make_pulse`](@ref)), the seasonal wave is analytic, so the returned closure
+evaluates the exact cosine — no sampling grid or time step is required.
 
 # Arguments
-- `dt`: Time step for sampling
-- `times`: Time range [start, end]
-- `period=1.0`: Period of oscillation
-- `shift=0.0`: Phase shift (positive = delay)
+- `times`: Simulation time span (e.g. the `(start, stop)` tuple). Accepted for
+  signature compatibility with the other signal builders; the returned closure
+  is exact, so `times` is not otherwise used.
+- `period=1.0`: Period of oscillation (must be > 0).
+- `shift=0.0`: Phase shift; the wave peaks at `t = shift` (positive = delay).
 
 # Returns
-- Interpolation function representing the seasonal pattern
+- A function `t -> cos(2π (t - shift) / period)` callable at any time `t`.
 
 # Examples
 ```julia
-julia> wave = make_seasonal(0.1, [0.0, 2.0], 1.0)
+julia> wave = make_seasonal((0.0, 2.0), 1.0)
 julia> wave(0.0)  # Peak of cosine
 1.0
 julia> wave(0.5)  # Trough
 -1.0
 ```
 """
-function make_seasonal(dt, times, period=1.0, shift=0.0)
+function make_seasonal(times, period=1.0, shift=0.0)
     @assert period > 0 "The period of the seasonal wave must be greater than 0."
-
-    time_vec = times[1]:dt:times[2]
-    phase = 2 * pi .* (time_vec .- shift) ./ period
-    y = cos.(phase)
-    func = itp(time_vec, y, method="linear", extrapolation="nearest")
-
-    return func
+    return t -> cos(2 * pi * (t - shift) / period)
 end
 
 # ============================================================================
@@ -413,12 +415,15 @@ end
 # ============================================================================
 
 """
-    round_IM(x::Real, digits::Int=0)
+    round_IM(x::Real, digits::Real=0)
 
 Round a number using Insight Maker's convention where 0.5 rounds up.
 
 Note: Julia's default `round()` uses banker's rounding where 0.5 rounds to nearest even.
 This function always rounds 0.5 up to match Insight Maker behavior.
+
+`digits` is accepted as any `Real` (and rounded to an `Int` internally) so that the
+R-to-Julia converter, which emits numeric literals as floats, can pass it directly.
 
 # Examples
 ```julia
@@ -430,14 +435,15 @@ julia> round_IM(2.5)
 3.0
 ```
 """
-function round_IM(x::Real, digits::Int=0)
-    scaled_x = x * 10.0^digits
+function round_IM(x::Real, digits::Real=0)
+    d = round(Int, digits)
+    scaled_x = x * 10.0^d
     frac = scaled_x % 1
 
     if abs(frac) == 0.5
-        return ceil(scaled_x) / 10.0^digits
+        return ceil(scaled_x) / 10.0^d
     else
-        return round(scaled_x) / 10.0^digits
+        return round(scaled_x) / 10.0^d
     end
 end
 
@@ -526,6 +532,83 @@ function hill(x, slope=1.0, midpoint=0.5, upper=1.0)
     @assert isfinite(slope) && isfinite(midpoint) && isfinite(upper) "slope, midpoint, and upper must be finite numeric values"
     return upper * x^slope / (midpoint^slope + x^slope)
 end
+
+"""
+    ricker(x, location=1, upper=1, shape=1, a=nothing, b=nothing)
+
+Generalized Ricker function: a smooth hump-shaped curve that rises from zero,
+peaks at `x = location` with value `upper`, then decays back towards zero.
+
+The function is
+
+    f(x) = upper * (x / location * exp(1 - x / location))^shape
+
+which expands to the equivalent coefficient form `f(x) = a * x^shape * exp(-b * x)`
+with `a = upper * (e / location)^shape` and `b = shape / location`. `shape = 1`
+gives the standard Ricker function `a * x * exp(-b * x)`; larger `shape` narrows
+the peak and smaller `shape` broadens it.
+
+Because the curve involves a fractional power of `x`, `x` is expected to be
+non-negative. Works on a scalar or, element-wise, on an array of `x`.
+
+# Arguments
+- `x`: Value(s) at which to evaluate the function.
+- `location=1`: Value of `x` at which the function peaks.
+- `upper=1`: Maximal value (height) of the function, attained at the peak.
+- `shape=1`: Exponent controlling the width of the peak.
+- `a`, `b`: Coefficients of the expanded form `a * x^shape * exp(-b * x)`. When
+  both are supplied they take precedence over `location`/`upper`, setting
+  `location = shape / b` and `upper = a * (location / e)^shape`. Supplying only
+  one of them is an error.
+
+The arguments are **positional** (matching the R signature order) so that
+sdbuildR's R→Julia translation, which drops argument names and emits positional
+calls, maps `ricker(x, upper = 10)` etc. to the correct slots. Do not redefine
+these as keyword arguments.
+
+# Examples
+```julia
+julia> ricker(1)
+1.0
+
+julia> ricker(2, 2, 10, 1)   # location=2, upper=10, shape=1
+10.0
+
+julia> ricker(3, 1, 1, 1, 2.5, 0.4)   # a=2.5, b=0.4 override location/upper
+0.9035826...
+```
+"""
+function ricker(x, location=1, upper=1, shape=1, a=nothing, b=nothing)
+    isa(shape, Number) || throw(ArgumentError("The `shape` parameter must be numeric."))
+
+    # Standard (a, b) parameterization, when supplied, overrides location/upper.
+    # These are the coefficients of the generalized form f(x) = a * x^shape * exp(-b * x).
+    # Note: unlike the R version, we cannot reject an explicit location/upper here,
+    # because sdbuildR's translation always fills those positions with their
+    # defaults before the a/b slots. When both a and b are given they simply win.
+    if a !== nothing || b !== nothing
+        if a === nothing || b === nothing
+            throw(ArgumentError("Both `a` and `b` must be supplied together. " *
+                "Either use `location` and `upper`, or supply both `a` and `b`."))
+        end
+        isa(a, Number) || throw(ArgumentError("The `a` parameter must be numeric."))
+        isa(b, Number) || throw(ArgumentError("The `b` parameter must be numeric."))
+
+        # Convert the generalized coefficients to the peak parameterization
+        location = shape / b
+        upper = a * (location / exp(1))^shape
+    end
+
+    isa(location, Number) || throw(ArgumentError("The `location` parameter must be numeric."))
+    isa(upper, Number) || throw(ArgumentError("The `upper` parameter must be numeric."))
+
+    return _ricker(x, location, upper, shape)
+end
+
+_ricker(x::Number, location, upper, shape) =
+    upper * (x / location * exp(1 - x / location))^shape
+_ricker(x::AbstractArray, location, upper, shape) =
+    _ricker.(x, location, upper, shape)
 
 """
     r_min(x::Number)
