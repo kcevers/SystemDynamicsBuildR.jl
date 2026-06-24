@@ -21,6 +21,7 @@ Pkg.update()          # update all packages to latest compatible versions
 Pkg.status()          # check status of all packages
 
 ## 4. Check for Package Issues
+Pkg.instantiate() # make my environment match the manifest
 Pkg.resolve()         # resolve any dependency issues
 Pkg.precompile()      # precompile all packages
 
