@@ -650,50 +650,75 @@ end
 # Statistical Summary Functions
 # ============================================================================
 
+# Canonical catalog of supported summary statistics, in column order. Mirrors
+# the R-side registry `ensemble_stat_funs` in sdbuildR (R/ensemble_r.R).
+const ENSEMBLE_STAT_NAMES = ["mean", "median", "sd", "var", "min", "max", "missing_count"]
+
+# Order a requested set of statistic names by the canonical catalog order,
+# dropping any names not in the catalog (the R side validates the set).
+_order_ensemble_stats(stats) = filter(s -> string(s) in string.(stats), ENSEMBLE_STAT_NAMES)
+
+# Compute a single named statistic over a vector of valid (non-missing) values.
+# `missing_count` is handled by the callers, since it depends on the pre-filter
+# count rather than the clean values.
+function _ensemble_stat_value(name::AbstractString, v)
+    if name == "mean"
+        return mean(v)
+    elseif name == "median"
+        return Statistics.median(v)
+    elseif name == "sd"
+        return Statistics.std(v)
+    elseif name == "var"
+        return var(v)
+    elseif name == "min"
+        return minimum(v)
+    elseif name == "max"
+        return maximum(v)
+    else
+        error("Unknown ensemble summary statistic: $name")
+    end
+end
+
 """
-    ensemble_summ(timeseries_df, quantiles=[0.025, 0.975])
+    ensemble_summ(timeseries_df, quantiles=[0.025, 0.975], stats=["mean", "median"])
 
 Compute summary statistics across ensemble trajectories.
 
 # Arguments
 - `timeseries_df`: DataFrame from `ensemble_to_df` or `ensemble_to_df_threaded`
 - `quantiles::Vector=[0.025, 0.975]`: Quantiles to compute (default: 95% interval)
+- `stats::Vector=["mean", "median"]`: Which summary statistics to compute. Any of
+  `"mean"`, `"median"`, `"sd"`, `"var"`, `"min"`, `"max"`, `"missing_count"`.
 
 # Returns
-DataFrame with columns: `condition, time, variable, mean, median, variance, missing_count, q<quantile>`
+DataFrame with columns: `condition, time, variable`, one column per requested
+statistic (in catalog order), then `quant1, quant2, ...` for each quantile (in
+the order given).
 """
-function ensemble_summ(timeseries_df, quantiles=[0.025, 0.975])
+function ensemble_summ(timeseries_df, quantiles=[0.025, 0.975], stats=["mean", "median"])
+    stats = _order_ensemble_stats(stats)
     stats_df = combine(groupby(timeseries_df, [:condition, :time, :variable])) do group
         values = group.value
 
         is_valid = .!(ismissing.(values) .| isnan.(values))
         clean_values = values[is_valid]
         num_missing = count(!, is_valid)
+        is_empty = isempty(clean_values)
 
-        if isempty(clean_values)
-            result = (
-                mean = NaN,
-                median = NaN,
-                variance = NaN,
-                missing_count = num_missing
-            )
-
-            for q in quantiles
-                q_str = replace(string(q), r"^0\." => "")
-                result = merge(result, (Symbol("q$q_str") => NaN,))
+        result = NamedTuple()
+        for s in stats
+            val = if s == "missing_count"
+                num_missing
+            elseif is_empty
+                NaN
+            else
+                _ensemble_stat_value(s, clean_values)
             end
-        else
-            result = (
-                mean = mean(clean_values),
-                median = Statistics.median(clean_values),
-                variance = var(clean_values),
-                missing_count = num_missing
-            )
-
-            for q in quantiles
-                q_str = replace(string(q), r"^0\." => "")
-                result = merge(result, (Symbol("q$q_str") => Statistics.quantile(clean_values, q),))
-            end
+            result = merge(result, (Symbol(s) => val,))
+        end
+        for (qi, q) in enumerate(quantiles)
+            val = is_empty ? NaN : Statistics.quantile(clean_values, q)
+            result = merge(result, (Symbol("quant$qi") => val,))
         end
 
         return result
@@ -703,7 +728,7 @@ function ensemble_summ(timeseries_df, quantiles=[0.025, 0.975])
 end
 
 """
-    ensemble_summ_threaded(timeseries_df, quantiles=[0.025, 0.975])
+    ensemble_summ_threaded(timeseries_df, quantiles=[0.025, 0.975], stats=["mean", "median"])
 
 Multi-threaded version of `ensemble_summ` for improved performance.
 
@@ -713,7 +738,8 @@ Same as `ensemble_summ`.
 # Returns
 Same as `ensemble_summ`.
 """
-function ensemble_summ_threaded(timeseries_df, quantiles=[0.025, 0.975])
+function ensemble_summ_threaded(timeseries_df, quantiles=[0.025, 0.975], stats=["mean", "median"])
+    stats = _order_ensemble_stats(stats)
     grouped_df = groupby(timeseries_df, [:condition, :time, :variable])
 
     group_keys = keys(grouped_df)
@@ -722,16 +748,12 @@ function ensemble_summ_threaded(timeseries_df, quantiles=[0.025, 0.975])
     condition_vals = Vector{Int}(undef, n_groups)
     time_vals = Vector{Float64}(undef, n_groups)
     variable_vals = Vector{String}(undef, n_groups)
-    mean_vals = Vector{Float64}(undef, n_groups)
-    variance_vals = Vector{Float64}(undef, n_groups)
-    median_vals = Vector{Float64}(undef, n_groups)
-    missing_counts = Vector{Int}(undef, n_groups)
 
-    quantile_arrays = Dict{String, Vector{Float64}}()
-    for q in quantiles
-        q_str = replace(string(q), r"^0\." => "")
-        quantile_arrays["q$q_str"] = Vector{Float64}(undef, n_groups)
+    stat_arrays = Dict{String, Vector{Float64}}()
+    for s in stats
+        stat_arrays[s] = Vector{Float64}(undef, n_groups)
     end
+    quant_arrays = [Vector{Float64}(undef, n_groups) for _ in quantiles]
 
     Base.Threads.@threads for i in 1:n_groups
         group = grouped_df[i]
@@ -741,46 +763,38 @@ function ensemble_summ_threaded(timeseries_df, quantiles=[0.025, 0.975])
         is_valid = .!(ismissing.(values) .| isnan.(values))
         clean_values = values[is_valid]
         num_missing = count(!, is_valid)
+        is_empty = isempty(clean_values)
 
         condition_vals[i] = key.condition
         time_vals[i] = key.time
         variable_vals[i] = key.variable
 
-        if isempty(clean_values)
-            mean_vals[i] = NaN
-            variance_vals[i] = NaN
-            median_vals[i] = NaN
-            for q in quantiles
-                q_str = replace(string(q), r"^0\." => "")
-                quantile_arrays["q$q_str"][i] = NaN
-            end
-        else
-            mean_vals[i] = mean(clean_values)
-            variance_vals[i] = var(clean_values)
-            median_vals[i] = Statistics.median(clean_values)
-            for q in quantiles
-                q_str = replace(string(q), r"^0\." => "")
-                quantile_arrays["q$q_str"][i] = Statistics.quantile(clean_values, q)
+        for s in stats
+            stat_arrays[s][i] = if s == "missing_count"
+                num_missing
+            elseif is_empty
+                NaN
+            else
+                _ensemble_stat_value(s, clean_values)
             end
         end
-
-        missing_counts[i] = num_missing
+        for (qi, q) in enumerate(quantiles)
+            quant_arrays[qi][i] = is_empty ? NaN : Statistics.quantile(clean_values, q)
+        end
     end
 
     stats_df = DataFrame(
         condition = condition_vals,
         time = time_vals,
-        variable = variable_vals,
-        mean = mean_vals,
-        median = median_vals,
-        variance = variance_vals,
-        missing_count = missing_counts;
+        variable = variable_vals;
         copycols = false
     )
 
-    for q in quantiles
-        q_str = replace(string(q), r"^0\." => "")
-        stats_df[!, Symbol("q$q_str")] = quantile_arrays["q$q_str"]
+    for s in stats
+        stats_df[!, Symbol(s)] = stat_arrays[s]
+    end
+    for (qi, _) in enumerate(quantiles)
+        stats_df[!, Symbol("quant$qi")] = quant_arrays[qi]
     end
 
     return stats_df

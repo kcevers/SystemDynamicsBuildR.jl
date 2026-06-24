@@ -711,8 +711,8 @@ using Random
                 value = [10.0, NaN, 12.0, missing]
             )
             
-            stats = ensemble_summ(timeseries_df)
-            
+            stats = ensemble_summ(timeseries_df, [0.025, 0.975], ["mean", "median", "missing_count"])
+
             @test nrow(stats) == 1
             @test stats.mean[1] ≈ 11.0  # mean of [10.0, 12.0]
             @test stats.missing_count[1] == 2
@@ -728,11 +728,11 @@ using Random
                 value = [NaN, NaN]
             )
             
-            stats = ensemble_summ(timeseries_df)
-            
+            stats = ensemble_summ(timeseries_df, [0.025, 0.975], ["mean", "median", "var"])
+
             @test isnan(stats.mean[1])
             @test isnan(stats.median[1])
-            @test isnan(stats.variance[1])
+            @test isnan(stats.var[1])
         end
 
         @testset "Multiple variables from S-I-R ensemble" begin
@@ -789,13 +789,13 @@ using Random
             )
             
             stats = ensemble_summ(timeseries_df, [0.1, 0.5, 0.9])
-            
-            @test hasproperty(stats, :q1)   # 0.1 → q1
-            @test hasproperty(stats, :q5)   # 0.5 → q5
-            @test hasproperty(stats, :q9)   # 0.9 → q9
-            
-            @test stats.q1[1] < stats.q5[1]  # Lower quantile
-            @test stats.q5[1] < stats.q9[1]  # Higher quantile
+
+            @test hasproperty(stats, :quant1)   # 0.1 → quant1
+            @test hasproperty(stats, :quant2)   # 0.5 → quant2
+            @test hasproperty(stats, :quant3)   # 0.9 → quant3
+
+            @test stats.quant1[1] < stats.quant2[1]  # Lower quantile
+            @test stats.quant2[1] < stats.quant3[1]  # Higher quantile
         end
 
         @testset "Multiple parameter combinations from ODE ensemble" begin
@@ -907,13 +907,14 @@ using Random
 
             timeseries_df = DataFrame(timeseries_data)
 
-            stats1 = ensemble_summ(timeseries_df)
-            stats2 = ensemble_summ_threaded(timeseries_df)
-            
+            req_stats = ["mean", "median", "var"]
+            stats1 = ensemble_summ(timeseries_df, [0.025, 0.975], req_stats)
+            stats2 = ensemble_summ_threaded(timeseries_df, [0.025, 0.975], req_stats)
+
             # Results should be identical (very small numerical differences possible)
             @test isapprox(stats1.mean, stats2.mean, rtol=1e-10)
             @test isapprox(stats1.median, stats2.median, rtol=1e-10)
-            @test isapprox(stats1.variance, stats2.variance, rtol=1e-10)
+            @test isapprox(stats1.var, stats2.var, rtol=1e-10)
         end
 
         @testset "ensemble_to_df_threaded - scalar state variable" begin
@@ -995,15 +996,15 @@ using Random
             @test maximum(ts_df.sim) == 2  # 2 replicates
             
             # Compute summaries
-            stats = ensemble_summ(ts_df)
-            
+            stats = ensemble_summ(ts_df, [0.025, 0.975], ["mean", "var", "missing_count"])
+
             # Should have stats for each time point (excluding time=0.0 in some cases)
             @test nrow(stats) >= 1
             @test all(stats.missing_count .== 0)
-            
+
             # Verify statistical measures make sense
             @test all(stats.mean .> 0)  # All means should be positive
-            @test all(stats.variance .>= 0)  # Variance should be non-negative
+            @test all(stats.var .>= 0)  # Variance should be non-negative
         end
     end
 
