@@ -1,7 +1,7 @@
 name = "SystemDynamicsBuildR"
 uuid = "5e1e22a7-6071-4b0e-93ea-a7ee2645ccdf"
 authors = ["Kyra Evers <kyra.c.evers@gmail.com>"]
-version = "0.3.1"
+version = "0.3.2"
 
 
 [deps]
