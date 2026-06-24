@@ -9,7 +9,7 @@ using .clean
 using .ensemble
 
 export itp, make_ramp, make_step, make_pulse, make_seasonal
-export round_IM, logit, expit, logistic, hill, r_min, r_max, r_diff
+export round_IM, logit, expit, logistic, hill, ricker, r_min, r_max, r_diff
 export r_as_logical, r_grep, r_rbind, r_upper_tri, r_lower_tri
 export r_na_omit, r_range, r_match, r_sort
 export r_rowsums, r_colsums, r_rowmeans, r_colmeans, r_cummax, r_cummin, r_rep
