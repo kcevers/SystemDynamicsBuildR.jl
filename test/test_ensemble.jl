@@ -798,6 +798,75 @@ using Random
             @test stats.quant2[1] < stats.quant3[1]  # Higher quantile
         end
 
+        @testset "Selectable summary statistics" begin
+            # One group with a known set of values plus one NaN, so every
+            # statistic has a checkable value and missing_count is non-zero.
+            timeseries_df = DataFrame(
+                condition = fill(1, 6),
+                sim = 1:6,
+                time = fill(0.0, 6),
+                variable = fill("x", 6),
+                value = [1.0, 2.0, 3.0, 4.0, 5.0, NaN]
+            )
+
+            all_stats = ["mean", "median", "sd", "var", "min", "max", "missing_count"]
+            stats = ensemble_summ(timeseries_df, [0.025, 0.975], all_stats)
+
+            @test nrow(stats) == 1
+            @test stats.mean[1] ≈ 3.0
+            @test stats.median[1] ≈ 3.0
+            @test stats.sd[1] ≈ std([1.0, 2.0, 3.0, 4.0, 5.0])
+            @test stats.var[1] ≈ var([1.0, 2.0, 3.0, 4.0, 5.0])
+            @test stats.min[1] ≈ 1.0
+            @test stats.max[1] ≈ 5.0
+            @test stats.missing_count[1] == 1
+
+            # Columns: grouping keys, the requested stats in catalog order, then
+            # quant columns in the order of `quantiles`.
+            @test names(stats) ==
+                  ["condition", "time", "variable", all_stats..., "quant1", "quant2"]
+
+            # Requesting a subset in scrambled order still yields catalog order.
+            scrambled = ensemble_summ(timeseries_df, [0.5], ["max", "mean", "sd"])
+            @test names(scrambled) ==
+                  ["condition", "time", "variable", "mean", "sd", "max", "quant1"]
+
+            # Threaded variant produces identical columns and values.
+            stats_thr = ensemble_summ_threaded(timeseries_df, [0.025, 0.975], all_stats)
+            @test names(stats_thr) == names(stats)
+            for col in ["mean", "median", "sd", "var", "min", "max"]
+                @test isapprox(stats[!, col], stats_thr[!, col], rtol = 1e-10)
+            end
+            @test stats_thr.missing_count[1] == 1
+
+            # All-missing group returns NaN for every statistic (empty path).
+            empty_df = DataFrame(
+                condition = [1, 1], sim = [1, 2], time = [0.0, 0.0],
+                variable = ["x", "x"], value = [NaN, NaN]
+            )
+            empty_stats = ensemble_summ(empty_df, [0.5], all_stats)
+            for col in ["mean", "median", "sd", "var", "min", "max"]
+                @test isnan(empty_stats[1, col])
+            end
+            @test empty_stats.missing_count[1] == 2
+        end
+
+        @testset "Summary statistic helpers" begin
+            v = [1.0, 2.0, 3.0, 4.0, 5.0]
+            @test ensemble._ensemble_stat_value("mean", v) ≈ 3.0
+            @test ensemble._ensemble_stat_value("median", v) ≈ 3.0
+            @test ensemble._ensemble_stat_value("sd", v) ≈ std(v)
+            @test ensemble._ensemble_stat_value("var", v) ≈ var(v)
+            @test ensemble._ensemble_stat_value("min", v) ≈ 1.0
+            @test ensemble._ensemble_stat_value("max", v) ≈ 5.0
+            @test_throws ErrorException ensemble._ensemble_stat_value("bogus", v)
+
+            # Ordering helper sorts by catalog order and drops unknown names.
+            @test ensemble._order_ensemble_stats(["max", "mean", "bogus"]) ==
+                  ["mean", "max"]
+            @test ensemble._order_ensemble_stats(String[]) == String[]
+        end
+
         @testset "Multiple parameter combinations from ODE ensemble" begin
             # Create ensemble with 2 parameter combos, 2 time points, varying replicates
             function decay!(du, u, p, t)
