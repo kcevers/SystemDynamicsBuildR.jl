@@ -19,11 +19,18 @@ using Pkg
 Pkg.activate(".")
 Pkg.update()          # update all packages to latest compatible versions
 Pkg.status()          # check status of all packages
+] status --outdated -m
+
+## 3b. To add a dependency:
+# In Julia REPL:
+# Pkg.add("Tables")
+
 
 ## 4. Check for Package Issues
 Pkg.instantiate() # make my environment match the manifest
 Pkg.resolve()         # resolve any dependency issues
 Pkg.precompile()      # precompile all packages
+Pkg.gc()
 
 ## 5. Run Tests
 Pkg.test()            # run all tests defined in the package

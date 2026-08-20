@@ -1,7 +1,9 @@
 using CSV
 using DataFrames
 using DiffEqCallbacks
-using OrdinaryDiffEq
+using OrdinaryDiffEqRosenbrock
+using OrdinaryDiffEqTsit5
+using OrdinaryDiffEqVerner
 using OrdinaryDiffEqLowOrderRK
 using SciMLBase
 using StatsBase
