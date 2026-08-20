@@ -23,6 +23,18 @@ export ensemble_to_df, ensemble_to_df_threaded
 export ensemble_summ, ensemble_summ_threaded
 export transform_intermediaries
 
+# SciMLBase dropped `sol.p` and `sol.u0` in favour of reading them off the problem, so
+# prefer `sol.prob`, which has been stable across versions. Each trajectory of an
+# ensemble carries its own remade problem, so this stays per-trajectory correct.
+#
+# Fall back to the flat fields for anything that is not a solution object. An
+# `output_func` may return a plain NamedTuple carrying t/u/p/u0 - which is exactly what
+# sdbuildR generates - and the tests use the same shape. Testing for `:prob` rather than
+# `:p` avoids being fooled by a model whose parameter is named `p`, which symbolic
+# indexing would expose as a property.
+@inline _sol_params(sol) = hasproperty(sol, :prob) ? sol.prob.p : sol.p
+@inline _sol_init(sol) = hasproperty(sol, :prob) ? sol.prob.u0 : sol.u0
+
 @inline function _group_replicate_indices(traj_ids::AbstractVector{Int}, ensemble_n::Int)
     n = length(traj_ids)
     j_vec = Vector{Int}(undef, n)
@@ -262,7 +274,7 @@ function ensemble_to_df(solve_out, init_names,
     param_symbols = Symbol[]
     param_indices = Int[]
     params_are_namedtuple = false
-    first_params = solve_out[1].p
+    first_params = _sol_params(solve_out[1])
     if isa(first_params, NamedTuple)
         params_are_namedtuple = true
         for (key, val) in pairs(first_params)
@@ -293,7 +305,7 @@ function ensemble_to_df(solve_out, init_names,
         row_idx = 1
 
         for (traj_idx, result) in enumerate(solve_out)
-            params = result.p
+            params = _sol_params(result)
             for param_idx in eachindex(param_names)
                 if params_are_namedtuple
                     param_val = getproperty(params, param_symbols[param_idx])
@@ -334,7 +346,7 @@ function ensemble_to_df(solve_out, init_names,
         row_idx = 1
 
         for (traj_idx, result) in enumerate(solve_out)
-            init_vals = result.u0
+            init_vals = _sol_init(result)
 
             if isa(init_vals, NamedTuple)
                 for init_idx in eachindex(init_val_names)
@@ -535,7 +547,7 @@ function ensemble_to_df_threaded(solve_out, init_names,
     param_symbols = Symbol[]
     param_indices = Int[]
     params_are_namedtuple = false
-    first_params = solve_out[1].p
+    first_params = _sol_params(solve_out[1])
     if isa(first_params, NamedTuple)
         params_are_namedtuple = true
         for (key, val) in pairs(first_params)
@@ -563,7 +575,7 @@ function ensemble_to_df_threaded(solve_out, init_names,
 
         Base.Threads.@threads for traj_idx in 1:n_trajectories
             result = solve_out[traj_idx]
-            params = result.p
+            params = _sol_params(result)
 
             for (param_idx, param_name) in enumerate(param_names)
                 row_idx = (traj_idx - 1) * length(param_names) + param_idx
@@ -603,7 +615,7 @@ function ensemble_to_df_threaded(solve_out, init_names,
 
         Base.Threads.@threads for traj_idx in 1:n_trajectories
             result = solve_out[traj_idx]
-            init_vals = result.u0
+            init_vals = _sol_init(result)
 
             if isa(init_vals, NamedTuple)
                 for (init_idx, init_name) in enumerate(init_val_names)

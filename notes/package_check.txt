@@ -8,6 +8,8 @@ juliaup update          # update juliaup itself + all installed Julia channels
 juliaup add release     # ensure latest stable is installed
 #juliaup add lts         # ensure latest LTS (1.10.x) is installed
 juliaup status          # confirm what versions you have
+#juliaup list           # check available Julia versions
+#juliaup add 1.13       # add specific version
 
 ## 2. Ensure you are in dev/ branch (not main/ branch) and have pulled latest changes
 git checkout dev
@@ -19,11 +21,18 @@ using Pkg
 Pkg.activate(".")
 Pkg.update()          # update all packages to latest compatible versions
 Pkg.status()          # check status of all packages
+] status --outdated -m
+
+## 3b. To add a dependency:
+# In Julia REPL:
+# Pkg.add("Tables")
+
 
 ## 4. Check for Package Issues
 Pkg.instantiate() # make my environment match the manifest
 Pkg.resolve()         # resolve any dependency issues
 Pkg.precompile()      # precompile all packages
+Pkg.gc()
 
 ## 5. Run Tests
 Pkg.test()            # run all tests defined in the package

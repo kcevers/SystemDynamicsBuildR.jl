@@ -1,6 +1,9 @@
 using SystemDynamicsBuildR.custom_func
 using Random
-using OrdinaryDiffEq
+using OrdinaryDiffEqLowOrderRK
+using OrdinaryDiffEqRosenbrock
+using OrdinaryDiffEqTsit5
+using OrdinaryDiffEqVerner
 using SciMLBase
 
 @testset "with_rng" begin

@@ -22,4 +22,7 @@ export ensemble_to_df, ensemble_to_df_threaded
 export ensemble_summ, ensemble_summ_threaded
 export transform_intermediaries
 
+# Must come last: the workload calls the exported functions above.
+include("precompile.jl")
+
 end

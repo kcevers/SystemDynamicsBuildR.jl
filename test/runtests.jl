@@ -8,4 +8,5 @@ using SystemDynamicsBuildR
     include("test_clean.jl")
     include("test_ensemble.jl")
     include("test_dependencies.jl")
+    include("test_precompile.jl")
 end;
